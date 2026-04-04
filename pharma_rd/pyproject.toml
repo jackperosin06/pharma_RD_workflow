@@ -1,0 +1,42 @@
+[project]
+name = "pharma-rd"
+version = "0.1.0"
+description = "Multi-agent pharma R&D workflow pipeline — application scaffold (Epic 1)."
+readme = "README.md"
+authors = [
+    { name = "Jack Perosin", email = "jackperosin@icloud.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "httpx>=0.28.1",
+    "pydantic>=2.12.5",
+    "pydantic-settings>=2.11.0",
+]
+
+[project.scripts]
+pharma-rd = "pharma_rd.main:main"
+
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["pharma_rd"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.4.2",
+    "ruff>=0.15.9",
+]
+
+[tool.ruff]
+target-version = "py312"
+src = ["pharma_rd", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
