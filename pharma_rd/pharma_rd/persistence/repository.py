@@ -12,6 +12,24 @@ RUN_STATUSES = frozenset(
 STAGE_STATUSES = frozenset({"pending", "running", "completed", "failed"})
 _TERMINAL_STAGE = frozenset({"completed", "failed"})
 
+# Short, safe text for operators (NFR-R1); no stack traces or secrets in DB.
+_MAX_ERROR_SUMMARY_LEN = 512
+
+
+def _normalize_stage_error_summary(
+    status: str, error_summary: str | None
+) -> str | None:
+    if status != "failed":
+        return None
+    if not error_summary:
+        return None
+    s = error_summary.strip()
+    if not s:
+        return None
+    if len(s) > _MAX_ERROR_SUMMARY_LEN:
+        return s[: _MAX_ERROR_SUMMARY_LEN - 3] + "..."
+    return s
+
 
 def _utc_now_iso() -> str:
     return datetime.now(UTC).isoformat()
@@ -33,6 +51,22 @@ def _require_stage_status(status: str) -> None:
 
 class RunRepository:
     """Persistence API for runs and stages (stdlib sqlite3 only)."""
+
+    def get_stage_artifact_sha256(
+        self,
+        conn: sqlite3.Connection,
+        run_id: str,
+        stage_key: str,
+    ) -> str | None:
+        """Return stored SHA-256 for a stage artifact row, if any."""
+        row = conn.execute(
+            """
+            SELECT sha256_hex FROM stage_artifacts
+            WHERE run_id = ? AND stage_key = ?
+            """,
+            (run_id, stage_key),
+        ).fetchone()
+        return str(row["sha256_hex"]) if row else None
 
     def create_run(
         self,
@@ -81,10 +115,13 @@ class RunRepository:
         run_id: str,
         stage_key: str,
         status: str,
+        *,
+        error_summary: str | None = None,
     ) -> None:
         _require_stage_status(status)
         if not stage_key.strip():
             raise ValueError("stage_key must be non-empty")
+        err_col = _normalize_stage_error_summary(status, error_summary)
         now = _utc_now_iso()
         row = conn.execute(
             """
@@ -99,11 +136,12 @@ class RunRepository:
             conn.execute(
                 """
                 INSERT INTO stages (
-                    run_id, stage_key, status, started_at, ended_at, updated_at
+                    run_id, stage_key, status, started_at, ended_at, updated_at,
+                    error_summary
                 )
-                VALUES (?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
-                (run_id, stage_key, status, started_at, ended_at, now),
+                (run_id, stage_key, status, started_at, ended_at, now, err_col),
             )
         else:
             prev_status = row["status"]
@@ -126,9 +164,10 @@ class RunRepository:
             conn.execute(
                 """
                 UPDATE stages
-                SET status = ?, updated_at = ?, started_at = ?, ended_at = ?
+                SET status = ?, updated_at = ?, started_at = ?, ended_at = ?,
+                    error_summary = ?
                 WHERE run_id = ? AND stage_key = ?
                 """,
-                (status, now, started_at, ended_at, run_id, stage_key),
+                (status, now, started_at, ended_at, err_col, run_id, stage_key),
             )
         conn.commit()

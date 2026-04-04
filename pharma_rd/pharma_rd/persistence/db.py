@@ -8,7 +8,7 @@ from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-CURRENT_SCHEMA_VERSION = 2
+CURRENT_SCHEMA_VERSION = 3
 
 
 def _parse_utc_iso(created_at: str) -> datetime:
@@ -66,6 +66,11 @@ CREATE TABLE stage_artifacts (
 CREATE INDEX idx_stage_artifacts_run_id ON stage_artifacts (run_id);
 """
 
+# v3: short operator-visible summary when a stage fails (NFR-R1); nullable.
+_DDL_V3 = """
+ALTER TABLE stages ADD COLUMN error_summary TEXT;
+"""
+
 
 def migrate(conn: sqlite3.Connection) -> None:
     """Apply DDL until `PRAGMA user_version` matches `CURRENT_SCHEMA_VERSION`."""
@@ -80,6 +85,10 @@ def migrate(conn: sqlite3.Connection) -> None:
         conn.executescript(_DDL_V2)
         conn.execute("PRAGMA user_version = 2")
         v = 2
+    if v < 3:
+        conn.executescript(_DDL_V3)
+        conn.execute("PRAGMA user_version = 3")
+        v = 3
     if v != CURRENT_SCHEMA_VERSION:
         raise RuntimeError(
             f"Database schema version {v} is not supported "

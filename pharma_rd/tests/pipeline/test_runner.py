@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import hashlib
 
+import httpx
 import pytest
+from pharma_rd.http_client import ConnectorFailure, IntegrationErrorClass
 from pharma_rd.persistence import connect, write_stage_artifact
 from pharma_rd.persistence.repository import RunRepository
 from pharma_rd.pipeline import PIPELINE_ORDER, run_pipeline
@@ -73,16 +75,82 @@ def test_pipeline_failure_marks_partial_failed_and_skips_downstream(
     assert run_status == "partial_failed"
 
     comp = conn.execute(
-        "SELECT status FROM stages WHERE run_id = ? AND stage_key = ?",
+        "SELECT status, error_summary FROM stages WHERE run_id = ? AND stage_key = ?",
         (rid, "competitor"),
     ).fetchone()
     assert comp[0] == "failed"
+    assert comp[1] is not None
+    assert "RuntimeError" in comp[1]
+    assert "simulated competitor failure" in comp[1]
 
     n_consumer = conn.execute(
         "SELECT COUNT(*) FROM stages WHERE run_id = ? AND stage_key = ?",
         (rid, "consumer"),
     ).fetchone()[0]
     assert n_consumer == 0
+
+
+def test_connector_failure_records_integration_class(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db = tmp_path / "c.db"
+    art = tmp_path / "art"
+    conn = connect(db)
+    repo = RunRepository()
+    rid = repo.create_run(conn)
+
+    def boom(run_id: str, clinical: ClinicalOutput) -> None:
+        _ = run_id, clinical
+        raise ConnectorFailure(
+            "upstream timed out",
+            error_class=IntegrationErrorClass.TIMEOUT,
+        )
+
+    monkeypatch.setattr("pharma_rd.pipeline.runner.competitor.run_competitor", boom)
+
+    with pytest.raises(ConnectorFailure):
+        run_pipeline(conn, artifact_root=art, run_id=rid)
+
+    comp = conn.execute(
+        "SELECT status, error_summary FROM stages WHERE run_id = ? AND stage_key = ?",
+        (rid, "competitor"),
+    ).fetchone()
+    assert comp[0] == "failed"
+    assert comp[1] is not None
+    assert "[timeout]" in comp[1]
+    assert "upstream timed out" in comp[1]
+
+
+def test_pipeline_with_connector_probe_uses_shared_client(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("PHARMA_RD_CONNECTOR_PROBE_URL", "http://probe.test/stage")
+    from pharma_rd.config import get_settings
+
+    get_settings.cache_clear()
+
+    calls: list[tuple[str, str]] = []
+
+    def fake_request(method: str, url: str, **kwargs: object) -> httpx.Response:
+        calls.append((method, url))
+        return httpx.Response(200)
+
+    monkeypatch.setattr(
+        "pharma_rd.agents.connector_probe.request_with_retries",
+        fake_request,
+    )
+
+    db = tmp_path / "p.db"
+    art = tmp_path / "a"
+    conn = connect(db)
+    repo = RunRepository()
+    rid = repo.create_run(conn)
+    run_pipeline(conn, artifact_root=art, run_id=rid)
+
+    assert len(calls) == len(PIPELINE_ORDER)
+    assert all(u == "http://probe.test/stage" for _, u in calls)
 
 
 def test_write_stage_artifact_persists_metadata(tmp_path) -> None:

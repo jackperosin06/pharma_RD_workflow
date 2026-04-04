@@ -116,6 +116,23 @@ def test_duplicate_explicit_run_id_raises(tmp_path: Path) -> None:
     conn.close()
 
 
+def test_failed_stage_persists_error_summary(tmp_path: Path) -> None:
+    repo = RunRepository()
+    conn = connect(tmp_path / "err.db")
+    rid = repo.create_run(conn)
+    repo.upsert_stage(conn, rid, "clinical", "running")
+    repo.upsert_stage(
+        conn, rid, "clinical", "failed", error_summary="ValueError: bad"
+    )
+    row = conn.execute(
+        "SELECT error_summary FROM stages WHERE run_id = ? AND stage_key = ?",
+        (rid, "clinical"),
+    ).fetchone()
+    assert row is not None
+    assert row[0] == "ValueError: bad"
+    conn.close()
+
+
 def test_empty_stage_key_raises(tmp_path: Path) -> None:
     repo = RunRepository()
     conn = connect(tmp_path / "h.db")

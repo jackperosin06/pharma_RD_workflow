@@ -7,7 +7,8 @@ from pharma_rd.pipeline.contracts import (
     DeliveryOutput,
     SynthesisOutput,
 )
-from pharma_rd.pipeline.runner import PIPELINE_ORDER, run_pipeline
+from pharma_rd.pipeline.order import PIPELINE_ORDER
+from pharma_rd.pipeline.runner import run_pipeline, run_pipeline_resume_from
 
 __all__ = [
     "PIPELINE_ORDER",
@@ -17,4 +18,5 @@ __all__ = [
     "DeliveryOutput",
     "SynthesisOutput",
     "run_pipeline",
+    "run_pipeline_resume_from",
 ]

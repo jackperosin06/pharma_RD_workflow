@@ -31,4 +31,7 @@ def test_python_module_entrypoint_exits_zero() -> None:
         check=False,
     )
     assert result.returncode == 0
-    assert "pharma_rd ready" in result.stdout
+    assert "usage:" in result.stdout.lower()
+    assert "run" in result.stdout
+    assert "scheduler" in result.stdout
+    assert "retry-stage" in result.stdout
