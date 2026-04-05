@@ -42,6 +42,11 @@ def test_pipeline_emits_json_lines_with_correlation(tmp_path, capsys) -> None:
     assert "run_completed" in events
     assert "stage_started" in events
     assert "stage_completed" in events
+    assert "clinical_publications" in events
+    assert "internal_research" in events
+    assert "competitor_regulatory" in events
+    assert "competitor_pipeline_disclosures" in events
+    assert "competitor_patent_flags" in events
     assert "agent_stub" in events
 
     for row in rows:
@@ -51,16 +56,30 @@ def test_pipeline_emits_json_lines_with_correlation(tmp_path, capsys) -> None:
     assert completed.get("run_status") == "completed"
     assert completed.get("completed_stage_count") == 5
 
+    clinical_ev = [r for r in rows if r.get("event") == "clinical_publications"]
+    assert len(clinical_ev) == 1
+    assert clinical_ev[0]["stage"] == "clinical"
+
+    ir_ev = [r for r in rows if r.get("event") == "internal_research"]
+    assert len(ir_ev) == 1
+    assert ir_ev[0]["stage"] == "clinical"
+
+    cr_ev = [r for r in rows if r.get("event") == "competitor_regulatory"]
+    assert len(cr_ev) == 1
+    assert cr_ev[0]["stage"] == "competitor"
+
+    cp_ev = [r for r in rows if r.get("event") == "competitor_pipeline_disclosures"]
+    assert len(cp_ev) == 1
+    assert cp_ev[0]["stage"] == "competitor"
+
+    pf_ev = [r for r in rows if r.get("event") == "competitor_patent_flags"]
+    assert len(pf_ev) == 1
+    assert pf_ev[0]["stage"] == "competitor"
+
     stub_rows = [r for r in rows if r.get("event") == "agent_stub"]
-    assert len(stub_rows) == 5
+    assert len(stub_rows) == 3
     for sr in stub_rows:
-        assert sr["stage"] in (
-            "clinical",
-            "competitor",
-            "consumer",
-            "synthesis",
-            "delivery",
-        )
+        assert sr["stage"] in ("consumer", "synthesis", "delivery")
         assert sr["agent"] == sr["stage"]
 
 

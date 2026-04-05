@@ -70,7 +70,7 @@ def test_retry_after_competitor_failure_completes_run(
         calls["n"] += 1
         if calls["n"] == 1:
             raise RuntimeError("simulated competitor failure")
-        return CompetitorOutput()
+        return CompetitorOutput(run_id=rid_)
 
     monkeypatch.setattr(
         "pharma_rd.pipeline.runner.competitor.run_competitor",

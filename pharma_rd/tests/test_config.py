@@ -31,3 +31,38 @@ def test_log_level_case_insensitive(monkeypatch: pytest.MonkeyPatch) -> None:
 
     get_settings.cache_clear()
     assert get_settings().log_level == "DEBUG"
+
+
+def test_therapeutic_area_labels_parsed(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("PHARMA_RD_THERAPEUTIC_AREAS", " diabetes , oncology ")
+    from pharma_rd.config import get_settings
+
+    get_settings.cache_clear()
+    assert get_settings().therapeutic_area_labels() == ["diabetes", "oncology"]
+
+
+def test_competitor_labels_parsed(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(
+        "PHARMA_RD_COMPETITOR_WATCHLIST",
+        " Acme , BetaPharma ",
+    )
+    from pharma_rd.config import get_settings
+
+    get_settings.cache_clear()
+    assert get_settings().competitor_labels() == ["Acme", "BetaPharma"]
+
+
+def test_pipeline_disclosure_scope_labels_parsed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(
+        "PHARMA_RD_PIPELINE_DISCLOSURE_SCOPES",
+        " Oncology , Rare disease ",
+    )
+    from pharma_rd.config import get_settings
+
+    get_settings.cache_clear()
+    assert get_settings().pipeline_disclosure_scope_labels() == [
+        "Oncology",
+        "Rare disease",
+    ]

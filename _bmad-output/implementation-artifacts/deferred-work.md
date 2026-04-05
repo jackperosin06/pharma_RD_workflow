@@ -19,3 +19,23 @@
 ## Deferred from: code review of 2-2-per-stage-timeouts-and-bounded-retries-for-external-calls.md (2026-04-05)
 
 - **Backoff jitter** — See story file Review Findings [Defer]; optional hardening for upstream protection.
+
+## Deferred from: code review of 3-1-discover-and-summarize-clinical-trial-publications-for-configured-tas.md (2026-04-05)
+
+- *(Superseded 2026-04-05)* **Abstract summary truncation note** — Implemented: `data_gaps` records per-PMID truncation when summaries exceed 800 characters.
+
+## Deferred from: code review of story 3-2 (2026-04-05)
+
+- **Unbounded `*.json` count per directory** — Per-file byte cap exists; optional max file count or batching if operators point large trees at the loader.
+
+- **PubMed `ConnectorFailure` fails the stage** — Internal research degrades without raising; PubMed path still fails the clinical stage on connector errors. Broader “complete with gaps” for outbound HTTP may be a follow-up if product wants NFR-I1 parity for network faults.
+
+## Deferred from: code review of story 4-1 (2026-04-05)
+
+- **Unbounded `*.json` under competitor fixture directory** — Optional max file count or batching if operators attach very large trees.
+
+- **OpenFDA `drugsfda` response shape** — Validate `application_number` / nested structures against live API responses over time; adjust mapper if FDA changes fields.
+
+## Deferred from: code review of 4-3-patent-filing-flags.md (2026-04-05)
+
+- **Downstream stages still stub** — `ConsumerOutput` / `SynthesisOutput` do not consume `patent_filing_flags` yet; expected until later epics wire synthesis and reporting to competitor output.

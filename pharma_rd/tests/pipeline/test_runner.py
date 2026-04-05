@@ -158,7 +158,11 @@ def test_write_stage_artifact_persists_metadata(tmp_path) -> None:
     conn = connect(db)
     repo = RunRepository()
     rid = repo.create_run(conn, run_id="aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
-    m = ClinicalOutput(note="x")
+    m = ClinicalOutput(
+        run_id=rid,
+        therapeutic_areas_configured=[],
+        data_gaps=["test artifact"],
+    )
     rec = write_stage_artifact(
         conn,
         artifact_root=tmp_path / "ar",

@@ -81,10 +81,115 @@ class Settings(BaseSettings):
             "before stub logic (practice/demo); leave unset to skip outbound HTTP."
         ),
     )
+    therapeutic_areas: str = Field(
+        default="",
+        description=(
+            "Comma-separated therapeutic area labels for clinical monitoring "
+            "(FR23 slice). Empty means no TA scope — Clinical stage completes with "
+            "explicit data_gaps (NFR-I1)."
+        ),
+    )
+    pubmed_eutils_base: str = Field(
+        default="https://eutils.ncbi.nlm.nih.gov/entrez/eutils",
+        description="Base URL for NCBI E-utilities (override only for tests).",
+    )
+    pubmed_max_results: int = Field(
+        default=5,
+        ge=1,
+        le=50,
+        description="Max PubMed articles to retrieve per clinical stage run (MVP cap).",
+    )
+    pubmed_tool_email: str | None = Field(
+        default=None,
+        description=(
+            "Contact email for NCBI E-utilities (recommended for responsible use); "
+            "passed as the email= query parameter when set."
+        ),
+    )
+    pubmed_tool_name: str = Field(
+        default="pharma_rd",
+        description="tool= parameter for NCBI E-utilities requests.",
+    )
+    internal_research_path: str | None = Field(
+        default=None,
+        description=(
+            "Optional JSON file or directory of *.json internal research summaries "
+            "(FR7). Unset = not configured."
+        ),
+    )
+    internal_research_max_file_bytes: int = Field(
+        default=262_144,
+        ge=1024,
+        le=10_485_760,
+        description="Max bytes per internal research JSON file (MVP guardrail).",
+    )
+    competitor_watchlist: str = Field(
+        default="",
+        description=(
+            "Comma-separated competitor labels for FR8 (MVP slice of FR24). "
+            "Empty means no watchlist — Competitor stage completes with explicit gaps."
+        ),
+    )
+    competitor_observation_days: int = Field(
+        default=30,
+        ge=1,
+        le=3650,
+        description=(
+            "Calendar days (UTC date arithmetic) for the observation window "
+            "surfaced in integration_notes (FR8)."
+        ),
+    )
+    competitor_regulatory_path: str | None = Field(
+        default=None,
+        description=(
+            "Optional JSON file or directory of *.json with approvals/disclosures "
+            "(practice mode). Unset = use live OpenFDA when watchlist is non-empty."
+        ),
+    )
+    competitor_regulatory_max_file_bytes: int = Field(
+        default=262_144,
+        ge=1024,
+        le=10_485_760,
+        description="Max bytes per competitor regulatory JSON fixture file.",
+    )
+    openfda_drugsfda_url: str = Field(
+        default="https://api.fda.gov/drug/drugsfda.json",
+        description="OpenFDA drugsfda search endpoint (override for tests).",
+    )
+    openfda_max_results: int = Field(
+        default=5,
+        ge=1,
+        le=50,
+        description="Max drugsfda records per competitor stage run (MVP cap).",
+    )
+    pipeline_disclosure_scopes: str = Field(
+        default="",
+        description=(
+            "Comma-separated watch scope labels/keywords for pipeline disclosures "
+            "(FR9). Empty means not configured — competitor output notes this "
+            "explicitly (NFR-I1)."
+        ),
+    )
 
     @field_validator("connector_probe_url", mode="before")
     @classmethod
     def empty_connector_probe_url_is_none(cls, v: object) -> str | None:
+        if v is None:
+            return None
+        s = str(v).strip()
+        return None if not s else s
+
+    @field_validator("internal_research_path", mode="before")
+    @classmethod
+    def empty_internal_research_path_is_none(cls, v: object) -> str | None:
+        if v is None:
+            return None
+        s = str(v).strip()
+        return None if not s else s
+
+    @field_validator("competitor_regulatory_path", mode="before")
+    @classmethod
+    def empty_competitor_regulatory_path_is_none(cls, v: object) -> str | None:
         if v is None:
             return None
         s = str(v).strip()
@@ -116,6 +221,28 @@ class Settings(BaseSettings):
                 f"log_level must be one of {allowed}; got {v!r} (PHARMA_RD_LOG_LEVEL)"
             )
         return s
+
+    def therapeutic_area_labels(self) -> list[str]:
+        """Non-empty stripped labels from ``therapeutic_areas``."""
+        if not self.therapeutic_areas.strip():
+            return []
+        return [p.strip() for p in self.therapeutic_areas.split(",") if p.strip()]
+
+    def competitor_labels(self) -> list[str]:
+        """Non-empty stripped labels from ``competitor_watchlist``."""
+        if not self.competitor_watchlist.strip():
+            return []
+        return [p.strip() for p in self.competitor_watchlist.split(",") if p.strip()]
+
+    def pipeline_disclosure_scope_labels(self) -> list[str]:
+        """Non-empty stripped labels from ``pipeline_disclosure_scopes`` (FR9)."""
+        if not self.pipeline_disclosure_scopes.strip():
+            return []
+        return [
+            p.strip()
+            for p in self.pipeline_disclosure_scopes.split(",")
+            if p.strip()
+        ]
 
 
 @lru_cache

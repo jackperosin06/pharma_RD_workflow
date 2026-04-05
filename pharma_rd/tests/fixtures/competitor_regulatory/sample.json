@@ -1,0 +1,40 @@
+{
+  "approvals": [
+    {
+      "title": "Practice-mode approval signal",
+      "summary": "Stub FDA application-style record for FR8 demos without live OpenFDA.",
+      "reference": "https://example.com/regulatory/approval-sample",
+      "source_label": "fixture",
+      "observed_at": "2026-01-20T12:00:00Z"
+    }
+  ],
+  "disclosures": [
+    {
+      "title": "Practice-mode material disclosure",
+      "summary": "Stub material regulatory disclosure for FR8 fixture path tests.",
+      "reference": "https://example.com/regulatory/disclosure-sample",
+      "source_label": "fixture",
+      "observed_at": "2026-01-18T09:00:00Z"
+    }
+  ],
+  "pipeline_disclosures": [
+    {
+      "title": "Practice-mode pipeline disclosure",
+      "summary": "Stub pipeline-relevant disclosure row for FR9 watch-scope tests.",
+      "reference": "https://example.com/pipeline/disclosure-sample",
+      "source_label": "fixture",
+      "observed_at": "2026-01-22T12:00:00Z",
+      "scope_tags": ["Oncology"]
+    }
+  ],
+  "patent_filing_flags": [
+    {
+      "title": "Practice-mode patent publication",
+      "summary": "Stub patent filing flag for FR10 competitor watchlist tests.",
+      "reference": "https://example.com/patent/sample",
+      "source_label": "fixture",
+      "observed_at": "2026-01-25T15:00:00Z",
+      "competitor_tags": ["AcmePharma"]
+    }
+  ]
+}

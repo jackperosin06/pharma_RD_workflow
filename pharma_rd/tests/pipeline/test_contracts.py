@@ -13,8 +13,8 @@ from pharma_rd.pipeline.contracts import (
 
 def test_contracts_json_roundtrip() -> None:
     models = [
-        ClinicalOutput(),
-        CompetitorOutput(),
+        ClinicalOutput(run_id="00000000-0000-0000-0000-000000000001"),
+        CompetitorOutput(run_id="00000000-0000-0000-0000-000000000002"),
         ConsumerOutput(),
         SynthesisOutput(),
         DeliveryOutput(),
