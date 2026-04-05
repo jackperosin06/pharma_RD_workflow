@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 from pharma_rd.agents.connector_probe import ensure_connector_probe
-from pharma_rd.config import get_settings
+from pharma_rd.config import Settings, get_settings
+from pharma_rd.integrations.openai_competitor import call_competitor_gpt_analysis
 from pharma_rd.integrations.regulatory_signals import (
     PatentFilingCandidate,
     PipelineDisclosureCandidate,
@@ -21,6 +22,66 @@ from pharma_rd.pipeline.contracts import (
 )
 
 _log = get_pipeline_logger("pharma_rd.agents.competitor")
+
+_SKIP_KEY_NOTE = (
+    "GPT competitor analysis skipped: PHARMA_RD_OPENAI_API_KEY not set (story 4.4)."
+)
+_SKIP_EMPTY_NOTE = (
+    "GPT competitor analysis skipped: no regulatory rows to analyze (story 4.4)."
+)
+
+
+def _append_note_once(out: CompetitorOutput, note: str) -> CompetitorOutput:
+    if note in out.integration_notes:
+        return out
+    return out.model_copy(
+        update={"integration_notes": list(out.integration_notes) + [note]}
+    )
+
+
+def _apply_competitor_gpt(
+    out: CompetitorOutput,
+    settings: Settings,
+) -> CompetitorOutput:
+    """Story 4.4: optional GPT-4o competitive intelligence pass.
+
+    Degrades like story 3.3 when the key is missing or the API fails.
+    """
+    if not settings.openai_api_key:
+        return _append_note_once(out, _SKIP_KEY_NOTE)
+
+    if (
+        not out.approval_items
+        and not out.disclosure_items
+        and not out.pipeline_disclosure_items
+        and not out.patent_filing_flags
+    ):
+        return _append_note_once(out, _SKIP_EMPTY_NOTE)
+
+    gpt, err = call_competitor_gpt_analysis(settings, out)
+    if gpt is not None:
+        _log.info(
+            "competitor gpt analysis completed",
+            extra={"event": "competitor_gpt_analysis", "outcome": "ok"},
+        )
+        return out.model_copy(update={"competitor_gpt_analysis": gpt})
+
+    _log.warning(
+        "competitor gpt analysis failed",
+        extra={
+            "event": "competitor_gpt_analysis",
+            "outcome": "failed",
+            "error_class": "openai",
+        },
+    )
+    notes = list(out.integration_notes)
+    gaps = list(out.data_gaps)
+    notes.append(
+        "GPT competitor analysis failed (OpenAI). Proceeding with fetch-only output "
+        f"(NFR-I1). Detail: {err}"
+    )
+    gaps.append(f"GPT competitor analysis unavailable: {err}")
+    return out.model_copy(update={"integration_notes": notes, "data_gaps": gaps})
 
 
 def run_competitor(run_id: str, clinical: ClinicalOutput) -> CompetitorOutput:
@@ -59,7 +120,7 @@ def run_competitor(run_id: str, clinical: ClinicalOutput) -> CompetitorOutput:
                 "patent_flag_count": 0,
             },
         )
-        return CompetitorOutput(
+        base = CompetitorOutput(
             run_id=run_id,
             data_gaps=[
                 "No competitor watchlist configured. Set "
@@ -75,6 +136,7 @@ def run_competitor(run_id: str, clinical: ClinicalOutput) -> CompetitorOutput:
                 "or pipeline scope (empty watchlist and empty pipeline scopes)."
             ],
         )
+        return _apply_competitor_gpt(base, settings)
 
     obs_note = (
         f"Observation window for this run: last {obs_days} calendar day(s) "
@@ -161,7 +223,7 @@ def run_competitor(run_id: str, clinical: ClinicalOutput) -> CompetitorOutput:
         },
     )
 
-    return CompetitorOutput(
+    base = CompetitorOutput(
         run_id=run_id,
         approval_items=approvals,
         disclosure_items=disclosures,
@@ -170,3 +232,4 @@ def run_competitor(run_id: str, clinical: ClinicalOutput) -> CompetitorOutput:
         data_gaps=gaps,
         integration_notes=notes,
     )
+    return _apply_competitor_gpt(base, settings)

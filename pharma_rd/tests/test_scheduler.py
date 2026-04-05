@@ -48,7 +48,9 @@ def test_scheduled_pipeline_run_job_calls_execute_without_summary(
     from pharma_rd.scheduler import scheduled_pipeline_run_job
 
     scheduled_pipeline_run_job()
-    assert calls == [{"emit_summary_json": False}]
+    assert calls == [
+        {"emit_summary_json": False, "enforce_cli_access": False},
+    ]
 
 
 def test_scheduler_timezone_must_be_valid_iana() -> None:
@@ -104,7 +106,7 @@ def test_execute_pipeline_run_respects_emit_flag(
 
     from pharma_rd.cli import execute_pipeline_run
 
-    rc = execute_pipeline_run(emit_summary_json=False)
+    rc = execute_pipeline_run(emit_summary_json=False, enforce_cli_access=False)
     assert rc == 0
     out = capsys.readouterr().out
     assert out.strip() == "" or "run_id" not in out

@@ -6,10 +6,11 @@ import json
 from pathlib import Path
 from unittest.mock import patch
 
-from pharma_rd.agents.competitor import run_competitor
+from pharma_rd.agents.competitor import _SKIP_KEY_NOTE, run_competitor
 from pharma_rd.config import get_settings
 from pharma_rd.pipeline.contracts import (
     ClinicalOutput,
+    CompetitorGptAnalysis,
     CompetitorOutput,
     RegulatoryApprovalItem,
 )
@@ -35,6 +36,9 @@ def test_run_competitor_no_watchlist() -> None:
         get_settings.cache_clear()
         out = run_competitor("run-x", _CLINICAL)
     assert isinstance(out, CompetitorOutput)
+    assert out.schema_version == 5
+    assert _SKIP_KEY_NOTE in out.integration_notes
+    assert out.competitor_gpt_analysis is None
     assert out.approval_items == []
     assert out.disclosure_items == []
     assert out.pipeline_disclosure_items == []
@@ -56,6 +60,9 @@ def test_run_competitor_fixture_path() -> None:
     ):
         get_settings.cache_clear()
         out = run_competitor("run-fix", _CLINICAL)
+    assert out.schema_version == 5
+    assert _SKIP_KEY_NOTE in out.integration_notes
+    assert out.competitor_gpt_analysis is None
     assert len(out.approval_items) == 1
     assert len(out.disclosure_items) == 1
     assert len(out.pipeline_disclosure_items) == 1
@@ -154,7 +161,7 @@ def test_run_competitor_patent_tags_no_match() -> None:
 def test_run_competitor_patent_row_without_competitor_tags_maps_to_first_label(
     tmp_path: Path,
 ) -> None:
-    """Omitted ``competitor_tags`` applies the row to the first watchlist label (FR10 MVP)."""
+    """Omitted ``competitor_tags`` maps row to first watchlist label (FR10 MVP)."""
     reg = {
         "patent_filing_flags": [
             {
@@ -217,3 +224,55 @@ def test_run_competitor_openfda_mocked() -> None:
         "PHARMA_RD_COMPETITOR_REGULATORY_PATH" in n for n in notes
     )
     assert any("PHARMA_RD_PIPELINE_DISCLOSURE_SCOPES empty" in n for n in notes)
+    assert _SKIP_KEY_NOTE in notes
+
+
+def test_run_competitor_gpt_enrichment_mocked() -> None:
+    gpt = CompetitorGptAnalysis(
+        strategic_commentary="Watch approvals.",
+        threat_opportunity_themes=["Threat A"],
+        urgent_attention_flag=True,
+        urgent_attention_items=["Approval Beta"],
+        urgent_attention_severity="medium",
+    )
+    with patch.dict(
+        "os.environ",
+        {
+            "PHARMA_RD_COMPETITOR_WATCHLIST": "AcmePharma",
+            "PHARMA_RD_COMPETITOR_REGULATORY_PATH": str(_FIXTURE),
+            "PHARMA_RD_PIPELINE_DISCLOSURE_SCOPES": "Oncology",
+            "PHARMA_RD_OPENAI_API_KEY": "sk-test",
+        },
+        clear=False,
+    ):
+        get_settings.cache_clear()
+        with patch(
+            "pharma_rd.agents.competitor.call_competitor_gpt_analysis",
+            return_value=(gpt, None),
+        ):
+            out = run_competitor("run-gpt", _CLINICAL)
+    assert out.competitor_gpt_analysis == gpt
+    assert out.competitor_gpt_analysis.urgent_attention_severity == "medium"
+    assert _SKIP_KEY_NOTE not in out.integration_notes
+
+
+def test_run_competitor_gpt_failure_degrades() -> None:
+    with patch.dict(
+        "os.environ",
+        {
+            "PHARMA_RD_COMPETITOR_WATCHLIST": "AcmePharma",
+            "PHARMA_RD_COMPETITOR_REGULATORY_PATH": str(_FIXTURE),
+            "PHARMA_RD_PIPELINE_DISCLOSURE_SCOPES": "Oncology",
+            "PHARMA_RD_OPENAI_API_KEY": "sk-test",
+        },
+        clear=False,
+    ):
+        get_settings.cache_clear()
+        with patch(
+            "pharma_rd.agents.competitor.call_competitor_gpt_analysis",
+            return_value=(None, "APIStatusError: 500"),
+        ):
+            out = run_competitor("run-gpt-fail", _CLINICAL)
+    assert out.competitor_gpt_analysis is None
+    assert any("GPT competitor analysis failed" in n for n in out.integration_notes)
+    assert any("APIStatusError" in g for g in out.data_gaps)

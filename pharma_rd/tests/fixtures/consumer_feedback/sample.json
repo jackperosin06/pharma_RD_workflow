@@ -1,0 +1,14 @@
+{
+  "feedback_themes": [
+    {
+      "theme": "taste and flavor",
+      "summary": "Mock reviews mention taste preferences for the category.",
+      "source": "https://example.com/consumer/mock-reviews"
+    },
+    {
+      "theme": "convenience",
+      "summary": "Consumers value packaging ease in public discussions.",
+      "source": "fixture:consumer_feedback/sample.json"
+    }
+  ]
+}

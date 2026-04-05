@@ -38,7 +38,10 @@ def scheduled_pipeline_run_job() -> None:
         )
         return
     try:
-        rc = execute_pipeline_run(emit_summary_json=False)
+        rc = execute_pipeline_run(
+            emit_summary_json=False,
+            enforce_cli_access=False,
+        )
         if rc != 0:
             _log.error(
                 "scheduled pipeline run exited with failure",

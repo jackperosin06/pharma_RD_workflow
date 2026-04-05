@@ -19,6 +19,7 @@ def test_settings_default() -> None:
     s = get_settings()
     assert isinstance(s, Settings)
     assert s.env == "development"
+    assert s.deployment_profile == "practice"
 
 
 def test_python_module_entrypoint_exits_zero() -> None:

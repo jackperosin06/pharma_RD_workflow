@@ -1,0 +1,15 @@
+{
+  "pharmacy_sales_trends": [
+    {
+      "summary": "Retail units up 2% YoY in tracked channels.",
+      "scope": "US pharmacy retail",
+      "period": "2025-Q4",
+      "source": "https://example.com/sales/mock"
+    },
+    {
+      "summary": "Wholesale volume flat vs prior quarter.",
+      "scope": "Regional wholesale",
+      "source": "fixture:pharmacy_sales/sample.json"
+    }
+  ]
+}

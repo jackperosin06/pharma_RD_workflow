@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import sys
 
+from pharma_rd.access_control import cli_access_exit_code
 from pharma_rd.config import get_settings
 from pharma_rd.operator_queries import get_run_with_stages, list_runs
 from pharma_rd.persistence import connect
@@ -13,12 +14,23 @@ from pharma_rd.pipeline import run_pipeline, run_pipeline_resume_from
 from pharma_rd.pipeline.resume_validation import validate_stage_retry
 
 
-def execute_pipeline_run(*, emit_summary_json: bool = True) -> int:
+def execute_pipeline_run(
+    *,
+    emit_summary_json: bool = True,
+    enforce_cli_access: bool = True,
+) -> int:
     """Create a run and execute the full pipeline (shared by ``run`` and scheduler).
 
     When ``emit_summary_json`` is False (scheduled runs), no summary JSON line is
     printed to stdout — structured logs from ``run_pipeline`` remain the trace.
+
+    ``enforce_cli_access``: when True and ``artifact_access_token`` is set, require
+    ``PHARMA_RD_CLI_ACCESS_TOKEN`` (FR32). Set False for in-process scheduled runs.
     """
+    if enforce_cli_access:
+        denied = cli_access_exit_code()
+        if denied is not None:
+            return denied
     settings = get_settings()
     conn = connect(settings.db_path)
     try:
@@ -55,6 +67,9 @@ def run_foreground_pipeline() -> int:
 
 def cmd_runs(*, limit: int) -> int:
     """Print one JSON object: `{"runs": [...]}` for operators and scripts (FR29)."""
+    denied = cli_access_exit_code()
+    if denied is not None:
+        return denied
     settings = get_settings()
     conn = connect(settings.db_path)
     try:
@@ -67,6 +82,9 @@ def cmd_runs(*, limit: int) -> int:
 
 def cmd_retry_stage(run_id: str, stage_key: str) -> int:
     """Resume a failed run from ``stage_key`` (FR30 / story 2.3)."""
+    denied = cli_access_exit_code()
+    if denied is not None:
+        return denied
     settings = get_settings()
     conn = connect(settings.db_path)
     try:
@@ -98,6 +116,9 @@ def cmd_retry_stage(run_id: str, stage_key: str) -> int:
 
 def cmd_status(run_id: str) -> int:
     """Print one JSON object with `run` and `stages` (per-agent status, FR31)."""
+    denied = cli_access_exit_code()
+    if denied is not None:
+        return denied
     settings = get_settings()
     conn = connect(settings.db_path)
     try:

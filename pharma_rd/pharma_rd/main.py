@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import sys
+
+from pydantic import ValidationError
 
 from pharma_rd import __version__
 
@@ -106,4 +109,9 @@ def main_exit_code() -> int:
 
 
 def main() -> None:
-    raise SystemExit(main_exit_code())
+    try:
+        code = main_exit_code()
+    except ValidationError as e:
+        print(str(e), file=sys.stderr)
+        raise SystemExit(1) from None
+    raise SystemExit(code)

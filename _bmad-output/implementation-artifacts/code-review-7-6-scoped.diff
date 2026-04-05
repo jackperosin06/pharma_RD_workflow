@@ -1,0 +1,2345 @@
+diff --git a/pharma_rd/pharma_rd/agents/delivery.py b/pharma_rd/pharma_rd/agents/delivery.py
+index 6ac6ad6..7520e21 100644
+--- a/pharma_rd/pharma_rd/agents/delivery.py
++++ b/pharma_rd/pharma_rd/agents/delivery.py
+@@ -1,17 +1,348 @@
+-"""Delivery agent (stub)."""
++"""Delivery agent — FR18 Markdown report (Epic 7)."""
+ 
+ from __future__ import annotations
+ 
++from html import escape
++from pathlib import Path
++
+ from pharma_rd.agents.connector_probe import ensure_connector_probe
+-from pharma_rd.logging_setup import get_pipeline_logger, log_agent_stub
++from pharma_rd.config import Settings, get_settings
++from pharma_rd.integrations.openai_report_delivery import call_gpt_report_delivery
++from pharma_rd.integrations.report_distribution import distribute_insight_report
++from pharma_rd.integrations.report_html_sanitize import sanitize_report_html_fragment
++from pharma_rd.integrations.slack_insight_notification import (
++    send_slack_insight_notification,
++)
++from pharma_rd.logging_setup import get_pipeline_logger
++from pharma_rd.persistence.artifacts import write_utf8_artifact_atomic
+ from pharma_rd.pipeline.contracts import DeliveryOutput, SynthesisOutput
+ 
+ _log = get_pipeline_logger("pharma_rd.agents.delivery")
+ 
++# FR22 — human-owned pursuit language (practice build; edit here for legal review).
++_FR22_EXECUTIVE_PLAIN = (
++    "Human judgment (FR22): Items in this report are recommendations for review "
++    "only—not approvals. Pursuit and portfolio decisions remain human-owned."
++)
++_FR22_EXECUTIVE_MD = (
++    "> **Human judgment (FR22):** Items in this report are **recommendations** "
++    "for review only—not **approvals**. **Pursuit and portfolio decisions remain "
++    "human-owned.**\n\n"
++)
++_FR22_PER_OPPORTUNITY_PLAIN = (
++    "Recommendation only—not an approval. Pursuit is a human decision."
++)
++_FR22_PER_OPPORTUNITY_MD = (
++    "> *Recommendation only—not an approval. Pursuit is a human decision.*\n\n"
++)
++_FR22_GOVERNANCE_PLAIN = (
++    "This report presents recommendations derived from signals available to the "
++    "workflow. It does not approve development, launch, or commercialization. "
++    "Pursuit decisions remain with qualified human decision-makers and your "
++    "organization's governance processes. Use this as input to judgment, not a "
++    "substitute for it."
++)
++_FR22_GOVERNANCE_MD = (
++    "This report presents **recommendations** derived from signals available to the "
++    "workflow. It does **not** approve development, launch, or commercialization. "
++    "**Pursuit decisions remain with qualified human decision-makers** and your "
++    "organization's governance processes. Use this as input to judgment, not a "
++    "substitute for it.\n"
++)
++_FR22_FOOTER_PLAIN = (
++    "Recommendations, not approvals—pursuit decisions remain human-owned (FR22)."
++)
++
++
++def _fr26_deployment_run_summary(settings: Settings) -> tuple[str, str]:
++    """Markdown + HTML fragments for FR26 when deployment profile is practice."""
++    if settings.deployment_profile != "practice":
++        return ("", "")
++    md = (
++        "- **Deployment (FR26):** Practice build — public/mock sources permitted; "
++        "enterprise SSO is not required for this MVP (FR34 is roadmap).\n\n"
++    )
++    html = (
++        "<p><strong>Deployment (FR26):</strong> Practice build — public/mock "
++        "sources permitted; enterprise SSO is not required for this MVP "
++        "(FR34 is roadmap).</p>\n"
++    )
++    return (md, html)
++
++
++def _fence(text: str) -> str:
++    """Fence free text so markdown metacharacters in upstream strings are contained."""
++    safe = text.replace("```", "``\u200b`")
++    return f"```text\n{safe}\n```\n"
++
++
++def _render_markdown(run_id: str, syn: SynthesisOutput) -> str:
++    settings = get_settings()
++    fr26_md, _ = _fr26_deployment_run_summary(settings)
++    lines: list[str] = []
++    lines.append(f"# Insight report ({run_id})\n")
++    lines.append("## Run summary\n")
++    lines.append(_FR22_EXECUTIVE_MD)
++    lines.append(fr26_md)
++    lines.append(f"- **signal_characterization:** `{syn.signal_characterization}`\n")
++    lines.append("- **scan_summary (FR28):**\n")
++    if syn.scan_summary_lines:
++        for s in syn.scan_summary_lines:
++            lines.append(f"  - {s}\n")
++    else:
++        lines.append("  - *(none — legacy or empty synthesis)*\n")
++    if syn.aggregated_upstream_gaps:
++        lines.append("- **upstream gaps (preview):**\n")
++        for g in syn.aggregated_upstream_gaps[:10]:
++            lines.append(f"  - {g}\n")
++        extra = len(syn.aggregated_upstream_gaps) - 10
++        if extra > 0:
++            lines.append(f"  - … ({extra} more)\n")
++    lines.append("\n## Ranked opportunities\n")
++    if not syn.ranked_opportunities:
++        lines.append("(none)\n")
++    else:
++        for row in sorted(syn.ranked_opportunities, key=lambda r: r.rank):
++            lines.append(f"### {row.rank}. {row.title}\n")
++            lines.append(_FR22_PER_OPPORTUNITY_MD)
++            lines.append("**Rationale**\n")
++            lines.append(_fence(row.rationale_short))
++            if row.evidence_references:
++                lines.append("**Evidence references**\n")
++                for er in row.evidence_references:
++                    lines.append(
++                        f"- **{er.domain}** — {er.label}: `{er.reference}`\n"
++                    )
++            lines.append("**Commercial viability**\n")
++            lines.append(_fence(row.commercial_viability))
++            lines.append("\n")
++    lines.append("## Governance and disclaimer\n")
++    lines.append(_FR22_GOVERNANCE_MD)
++    return "".join(lines)
++
++
++def _ensure_fr22_html_fragment(fragment: str) -> str:
++    """Inject executive FR22 banner if model omitted required compliance text."""
++    low = fragment.lower()
++    if "human judgment" in low and "fr22" in low:
++        return fragment
++    return (
++        '<section class="fr22-executive"><p><strong>Human judgment (FR22):</strong> '
++        "Items in this report are recommendations for review only—not approvals. "
++        "Pursuit and portfolio decisions remain human-owned.</p></section>\n"
++        + fragment
++    )
+ 
+-def run_delivery(run_id: str, synthesis: SynthesisOutput) -> DeliveryOutput:
+-    """Final stage: consumes synthesis output."""
+-    _ = run_id, synthesis
++
++def _ensure_fr22_markdown(md: str) -> str:
++    if "human judgment" in md.lower() and "fr22" in md.lower():
++        return md
++    return _FR22_EXECUTIVE_MD + md
++
++
++def _wrap_gpt_html_fragment(run_id: str, inner: str, settings: Settings) -> str:
++    """Trusted shell around sanitized GPT body fragment (story 7.6)."""
++    _, fr26_html = _fr26_deployment_run_summary(settings)
++    parts: list[str] = []
++    parts.append("<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n")
++    parts.append('<meta charset="utf-8" />\n')
++    parts.append(f"<title>Insight report ({escape(run_id)})</title>\n")
++    parts.append(
++        "<style>"
++        "body{font-family:system-ui,Segoe UI,sans-serif;max-width:52rem;margin:1rem;"
++        "line-height:1.45;}"
++        "pre{white-space:pre-wrap;word-break:break-word;background:#f6f8fa;padding:0.5rem;}"
++        "</style>\n</head>\n<body>\n"
++    )
++    parts.append(inner)
++    parts.append("\n")
++    parts.append(fr26_html)
++    parts.append("</body>\n</html>\n")
++    return "".join(parts)
++
++
++def _render_html(run_id: str, syn: SynthesisOutput) -> str:
++    """Parallel HTML view for NFR-P2 (open in any browser without extensions)."""
++    settings = get_settings()
++    _, fr26_html = _fr26_deployment_run_summary(settings)
++    parts: list[str] = []
++    parts.append("<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n")
++    parts.append('<meta charset="utf-8" />\n')
++    parts.append(f"<title>Insight report ({escape(run_id)})</title>\n")
++    parts.append(
++        "<style>"
++        "body{font-family:system-ui,Segoe UI,sans-serif;max-width:52rem;margin:1rem;"
++        "line-height:1.45;}"
++        "pre{white-space:pre-wrap;word-break:break-word;background:#f6f8fa;padding:0.5rem;}"
++        "</style>\n</head>\n<body>\n"
++    )
++    parts.append(f"<h1>Insight report ({escape(run_id)})</h1>\n")
++    parts.append("<h2>Run summary</h2>\n")
++    parts.append(
++        f"<blockquote><p>{escape(_FR22_EXECUTIVE_PLAIN)}</p></blockquote>\n"
++    )
++    parts.append(fr26_html)
++    parts.append("<ul>\n")
++    parts.append(
++        "<li><strong>signal_characterization:</strong> "
++        f"{escape(str(syn.signal_characterization))}</li>\n"
++    )
++    parts.append("<li><strong>scan_summary (FR28):</strong><ul>\n")
++    if syn.scan_summary_lines:
++        for s in syn.scan_summary_lines:
++            parts.append(f"<li>{escape(s)}</li>\n")
++    else:
++        parts.append("<li><em>(none — legacy or empty synthesis)</em></li>\n")
++    parts.append("</ul></li>\n")
++    if syn.aggregated_upstream_gaps:
++        parts.append("<li><strong>upstream gaps (preview):</strong><ul>\n")
++        for g in syn.aggregated_upstream_gaps[:10]:
++            parts.append(f"<li>{escape(g)}</li>\n")
++        extra = len(syn.aggregated_upstream_gaps) - 10
++        if extra > 0:
++            parts.append(f"<li>… ({extra} more)</li>\n")
++        parts.append("</ul></li>\n")
++    parts.append("</ul>\n")
++    parts.append("<h2>Ranked opportunities</h2>\n")
++    if not syn.ranked_opportunities:
++        parts.append("<p>(none)</p>\n")
++    else:
++        for row in sorted(syn.ranked_opportunities, key=lambda r: r.rank):
++            parts.append(
++                f"<h3>{escape(str(row.rank))}. {escape(row.title)}</h3>\n"
++            )
++            parts.append(
++                f"<p><em>{escape(_FR22_PER_OPPORTUNITY_PLAIN)}</em></p>\n"
++            )
++            parts.append("<p><strong>Rationale</strong></p>\n")
++            parts.append(f"<pre>{escape(row.rationale_short)}</pre>\n")
++            if row.evidence_references:
++                parts.append("<p><strong>Evidence references</strong></p>\n<ul>\n")
++                for er in row.evidence_references:
++                    parts.append(
++                        "<li><strong>"
++                        + escape(er.domain)
++                        + "</strong> — "
++                        + escape(er.label)
++                        + ": "
++                        + escape(er.reference)
++                        + "</li>\n"
++                    )
++                parts.append("</ul>\n")
++            parts.append("<p><strong>Commercial viability</strong></p>\n")
++            parts.append(f"<pre>{escape(row.commercial_viability)}</pre>\n")
++    parts.append("<h2>Governance and disclaimer</h2>\n")
++    parts.append(f"<p>{escape(_FR22_GOVERNANCE_PLAIN)}</p>\n")
++    parts.append("<footer>\n")
++    parts.append(f"<p>{escape(_FR22_FOOTER_PLAIN)}</p>\n")
++    parts.append("</footer>\n")
++    parts.append("</body>\n</html>\n")
++    return "".join(parts)
++
++
++def run_delivery(
++    run_id: str,
++    synthesis: SynthesisOutput,
++    artifact_root: Path,
++) -> DeliveryOutput:
++    """Write ``report.md`` and ``report.html``; return metadata for ``output.json``."""
++    if synthesis.run_id and synthesis.run_id != run_id:
++        raise ValueError(
++            "run_id mismatch: expected "
++            f"{run_id!r}, synthesis has {synthesis.run_id!r}"
++        )
+     ensure_connector_probe("delivery")
+-    log_agent_stub(_log)
+-    return DeliveryOutput()
++    settings = get_settings()
++    gpt_excerpt: str | None = None
++    body: str
++    html_body: str
++
++    use_gpt = settings.report_renderer == "gpt" and bool(settings.openai_api_key)
++    if use_gpt:
++        gpt_result, gpt_err = call_gpt_report_delivery(settings, run_id, synthesis)
++        if gpt_result is not None:
++            frag = sanitize_report_html_fragment(gpt_result.report_html_fragment)
++            frag = _ensure_fr22_html_fragment(frag)
++            body = _ensure_fr22_markdown(gpt_result.report_markdown)
++            html_body = _wrap_gpt_html_fragment(run_id, frag, settings)
++            if gpt_result.slack_executive_excerpt:
++                gpt_excerpt = gpt_result.slack_executive_excerpt
++        elif settings.report_gpt_fallback_on_error:
++            _log.warning(
++                "delivery GPT report failed; using template renderer",
++                extra={
++                    "event": "delivery_gpt_fallback",
++                    "outcome": "ok",
++                    "detail": gpt_err or "unknown",
++                },
++            )
++            body = _render_markdown(run_id, synthesis)
++            html_body = _render_html(run_id, synthesis)
++        else:
++            raise ValueError(
++                "GPT report delivery failed and PHARMA_RD_REPORT_GPT_FALLBACK_ON_ERROR "
++                f"is false: {gpt_err or 'unknown_error'}"
++            )
++    elif settings.report_renderer == "gpt" and not settings.openai_api_key:
++        _log.warning(
++            "PHARMA_RD_REPORT_RENDERER=gpt but PHARMA_RD_OPENAI_API_KEY is unset; "
++            "using template renderer",
++            extra={"event": "delivery_gpt_skipped_no_key", "outcome": "ok"},
++        )
++        body = _render_markdown(run_id, synthesis)
++        html_body = _render_html(run_id, synthesis)
++    else:
++        body = _render_markdown(run_id, synthesis)
++        html_body = _render_html(run_id, synthesis)
++
++    rel, size = write_utf8_artifact_atomic(
++        artifact_root,
++        (run_id, "delivery", "report.md"),
++        body,
++    )
++    rel_html, size_html = write_utf8_artifact_atomic(
++        artifact_root,
++        (run_id, "delivery", "report.html"),
++        html_body,
++    )
++    _log.info(
++        "delivery report written",
++        extra={
++            "event": "delivery_report_written",
++            "outcome": "ok",
++            "report_relative_path": rel,
++            "report_byte_size": size,
++            "report_html_relative_path": rel_html,
++            "report_html_byte_size": size_html,
++        },
++    )
++    slack_st, slack_det = send_slack_insight_notification(
++        webhook_url=settings.slack_webhook_url,
++        run_id=run_id,
++        synthesis=synthesis,
++        settings=settings,
++        artifact_root=artifact_root,
++        logger=_log,
++        timeout_seconds=settings.slack_webhook_timeout_seconds,
++        gpt_executive_excerpt=gpt_excerpt,
++    )
++    d_ch, d_st, d_det = distribute_insight_report(
++        run_id,
++        artifact_root,
++        settings=settings,
++        logger=_log,
++    )
++    return DeliveryOutput(
++        schema_version=3,
++        run_id=run_id,
++        report_relative_path=rel,
++        report_format="markdown",
++        report_byte_size=size,
++        report_html_relative_path=rel_html,
++        report_html_byte_size=size_html,
++        distribution_channel=d_ch,
++        distribution_status=d_st,
++        distribution_detail=d_det,
++        slack_notify_status=slack_st,
++        slack_notify_detail=slack_det,
++    )
+diff --git a/pharma_rd/pharma_rd/config.py b/pharma_rd/pharma_rd/config.py
+index 49e30d6..8fea845 100644
+--- a/pharma_rd/pharma_rd/config.py
++++ b/pharma_rd/pharma_rd/config.py
+@@ -1,7 +1,12 @@
+ """Central settings — use `get_settings()` everywhere; do not read os.environ ad hoc."""
+ 
++from __future__ import annotations
++
++import re
+ from functools import lru_cache
+ from pathlib import Path
++from typing import Literal
++from urllib.parse import urlparse
+ from zoneinfo import ZoneInfo
+ 
+ from pydantic import Field, field_validator
+@@ -9,6 +14,113 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
+ 
+ _STD_LOG_LEVELS = frozenset({"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"})
+ 
++# FR23 / story 8.1 — comma-separated TA labels; empty string = no scope (NFR-I1).
++_THERAPEUTIC_AREAS_MAX_LABELS = 32
++_THERAPEUTIC_AREAS_MAX_LABEL_LEN = 128
++# Unicode letters/digits/underscore, spaces, hyphen — no commas inside a label.
++_THERAPEUTIC_LABEL_RE = re.compile(r"^[\w\s\-]+$", re.UNICODE)
++
++
++def _normalize_and_validate_therapeutic_areas(v: str) -> str:
++    """Normalize therapeutic area labels; empty string means no scope.
++
++    Raises ValueError if any label is invalid.
++    """
++    s = str(v).strip()
++    if not s:
++        return ""
++    raw_parts = s.split(",")
++    labels: list[str] = []
++    for i, part in enumerate(raw_parts):
++        seg = part.strip()
++        if not seg:
++            raise ValueError(
++                "PHARMA_RD_THERAPEUTIC_AREAS contains an empty label between commas "
++                f"(segment index {i}); remove extra commas."
++            )
++        if len(seg) > _THERAPEUTIC_AREAS_MAX_LABEL_LEN:
++            raise ValueError(
++                "PHARMA_RD_THERAPEUTIC_AREAS label "
++                f"{len(labels) + 1} exceeds max length "
++                f"{_THERAPEUTIC_AREAS_MAX_LABEL_LEN} characters"
++            )
++        if not _THERAPEUTIC_LABEL_RE.fullmatch(seg):
++            raise ValueError(
++                "PHARMA_RD_THERAPEUTIC_AREAS label "
++                f"{len(labels) + 1} ({seg!r}) uses disallowed characters; "
++                "use letters, digits, spaces, hyphen, and underscore only "
++                "(FR23 / story 8.1)."
++            )
++        labels.append(seg)
++    if len(labels) > _THERAPEUTIC_AREAS_MAX_LABELS:
++        raise ValueError(
++            f"PHARMA_RD_THERAPEUTIC_AREAS has too many labels "
++            f"(max {_THERAPEUTIC_AREAS_MAX_LABELS}, got {len(labels)})"
++        )
++    return ", ".join(labels)
++
++
++# FR24 / story 8.2 — comma-separated competitor labels; empty = no watchlist (NFR-I1).
++# Same label/count caps as FR23; allow & . ( ) for corporate-style identifiers.
++_COMPETITOR_WATCHLIST_MAX_LABELS = 32
++_COMPETITOR_WATCHLIST_MAX_LABEL_LEN = 128
++_COMPETITOR_LABEL_RE = re.compile(r"^[\w\s\-&.,()]+$", re.UNICODE)
++
++
++def _normalize_and_validate_competitor_watchlist(v: str) -> str:
++    """Normalize competitor watchlist labels; empty string means no watchlist.
++
++    Raises ValueError if any label is invalid.
++    """
++    s = str(v).strip()
++    if not s:
++        return ""
++    raw_parts = s.split(",")
++    labels: list[str] = []
++    for i, part in enumerate(raw_parts):
++        seg = part.strip()
++        if not seg:
++            raise ValueError(
++                "PHARMA_RD_COMPETITOR_WATCHLIST contains an empty label between "
++                f"commas (segment index {i}); remove extra commas."
++            )
++        if len(seg) > _COMPETITOR_WATCHLIST_MAX_LABEL_LEN:
++            raise ValueError(
++                "PHARMA_RD_COMPETITOR_WATCHLIST label "
++                f"{len(labels) + 1} exceeds max length "
++                f"{_COMPETITOR_WATCHLIST_MAX_LABEL_LEN} characters"
++            )
++        if not _COMPETITOR_LABEL_RE.fullmatch(seg):
++            raise ValueError(
++                "PHARMA_RD_COMPETITOR_WATCHLIST label "
++                f"{len(labels) + 1} ({seg!r}) uses disallowed characters; "
++                "use letters, digits, spaces, hyphen, underscore, "
++                "ampersand, period, and parentheses only (FR24 / story 8.2)."
++            )
++        labels.append(seg)
++    if len(labels) > _COMPETITOR_WATCHLIST_MAX_LABELS:
++        raise ValueError(
++            f"PHARMA_RD_COMPETITOR_WATCHLIST has too many labels "
++            f"(max {_COMPETITOR_WATCHLIST_MAX_LABELS}, got {len(labels)})"
++        )
++    return ", ".join(labels)
++
++
++def _validate_http_url(value: str, field_label: str) -> str:
++    """Require http(s) URL with a host (FR25 / story 8.3)."""
++    s = str(value).strip()
++    p = urlparse(s)
++    if p.scheme not in ("http", "https"):
++        raise ValueError(
++            f"{field_label} must use http or https with a host; got {value!r} "
++            "(FR25 / story 8.3)."
++        )
++    if not p.netloc:
++        raise ValueError(
++            f"{field_label} must include a host; got {value!r} (FR25 / story 8.3)."
++        )
++    return s
++
+ 
+ class Settings(BaseSettings):
+     """Application settings loaded from environment (PHARMA_RD_*)."""
+@@ -21,6 +133,14 @@ class Settings(BaseSettings):
+     )
+ 
+     env: str = "development"
++    deployment_profile: Literal["practice", "staging", "production"] = Field(
++        default="practice",
++        description=(
++            "Deployment profile: practice = public/mock-capable demo build without "
++            "enterprise SSO (FR26). staging/production reserve future hardening; "
++            "enterprise IdP integration is FR34 roadmap, not MVP."
++        ),
++    )
+     db_path: Path = Field(
+         default=Path("data/app.db"),
+         description="SQLite database file (relative to process cwd unless absolute).",
+@@ -170,6 +290,204 @@ class Settings(BaseSettings):
+             "explicitly (NFR-I1)."
+         ),
+     )
++    consumer_feedback_path: str | None = Field(
++        default=None,
++        description=(
++            "Optional JSON file or directory of *.json with feedback_themes "
++            "(FR11 practice). Unset = use practice mock or gaps per settings."
++        ),
++    )
++    consumer_feedback_max_file_bytes: int = Field(
++        default=262_144,
++        ge=1024,
++        le=10_485_760,
++        description="Max bytes per consumer feedback JSON fixture file.",
++    )
++    practice_consumer_mock: bool = Field(
++        default=True,
++        description=(
++            "When True and consumer_feedback_path is unset, emit built-in practice "
++            "themes (FR26; aligns with deployment_profile=practice). When False with "
++            "no path, stage completes with data_gaps only (NFR-I1)."
++        ),
++    )
++    pharmacy_sales_path: str | None = Field(
++        default=None,
++        description=(
++            "Optional JSON file or directory of *.json with pharmacy_sales_trends "
++            "(FR12). Unset = no pharmacy sales feed (NFR-I1 note in output)."
++        ),
++    )
++    pharmacy_sales_max_file_bytes: int = Field(
++        default=262_144,
++        ge=1024,
++        le=10_485_760,
++        description="Max bytes per pharmacy sales JSON fixture file.",
++    )
++    unmet_need_demand_path: str | None = Field(
++        default=None,
++        description=(
++            "Optional JSON file or directory of *.json with unmet_need_demand_signals "
++            "(FR13). Unset = no market demand feed (NFR-I1 note in output)."
++        ),
++    )
++    unmet_need_demand_max_file_bytes: int = Field(
++        default=262_144,
++        ge=1024,
++        le=10_485_760,
++        description="Max bytes per unmet-need / demand JSON fixture file.",
++    )
++    distribution_channel: Literal["none", "file_drop", "smtp"] = Field(
++        default="none",
++        description=(
++            "FR19: none = no distribution; file_drop = copy report under "
++            "distribution_drop_dir; smtp reserved (not implemented in MVP)."
++        ),
++    )
++    distribution_drop_dir: str | None = Field(
++        default=None,
++        description=(
++            "Directory root for file_drop copies (rd/ and marketing/ per run). "
++            "Required when distribution_channel is file_drop."
++        ),
++    )
++    rd_recipient_email: str = Field(
++        default="",
++        description="Optional R&D address for future SMTP (FR19).",
++    )
++    marketing_recipient_email: str = Field(
++        default="",
++        description="Optional marketing address for future SMTP (FR19).",
++    )
++    slack_webhook_url: str | None = Field(
++        default=None,
++        description=(
++            "Slack incoming webhook URL for insight-run notifications (FR19). "
++            "Unset = no Slack POST (NFR-S1)."
++        ),
++    )
++    slack_webhook_timeout_seconds: float = Field(
++        default=10.0,
++        ge=1.0,
++        le=60.0,
++        description=(
++            "Timeout for Slack webhook POST (seconds); separate from connector HTTP."
++        ),
++    )
++    openai_api_key: str | None = Field(
++        default=None,
++        description=(
++            "OpenAI API key for GPT clinical/competitor/consumer/synthesis/report "
++            "stories (NFR-S1). Unset = skip LLM steps with integration_notes. "
++            "Never commit real values."
++        ),
++    )
++    openai_model: str = Field(
++        default="gpt-4o",
++        description="Chat model id for OpenAI completions (story 3.3+).",
++    )
++    openai_timeout_seconds: float = Field(
++        default=120.0,
++        ge=5.0,
++        le=600.0,
++        description="Timeout for OpenAI API calls (seconds; NFR-P3).",
++    )
++    openai_synthesis_timeout_seconds: float = Field(
++        default=180.0,
++        ge=10.0,
++        le=600.0,
++        description=(
++            "Timeout for OpenAI synthesis stage calls (NFR-P1); may exceed "
++            "openai_timeout_seconds for long cross-domain prompts."
++        ),
++    )
++    synthesis_mode: Literal["gpt", "deterministic"] = Field(
++        default="gpt",
++        description=(
++            "Story 6.5: gpt = OpenAI JSON synthesis when API key is set "
++            "(fails if key missing); deterministic = legacy cross-domain ranking "
++            "without LLM (offline / CI)."
++        ),
++    )
++    openai_report_delivery_timeout_seconds: float = Field(
++        default=150.0,
++        ge=10.0,
++        le=600.0,
++        description=(
++            "Timeout for OpenAI GPT report delivery calls (story 7.6 / NFR-P1)."
++        ),
++    )
++    report_renderer: Literal["gpt", "template"] = Field(
++        default="template",
++        description=(
++            "Story 7.6: gpt = OpenAI narrative HTML/Markdown when API key is set; "
++            "template = string-template renderer (CI default)."
++        ),
++    )
++    report_gpt_fallback_on_error: bool = Field(
++        default=True,
++        description=(
++            "Story 7.6: if GPT report delivery fails, fall back to template renderer "
++            "and log a warning (NFR-R1)."
++        ),
++    )
++    insight_org_display_name: str = Field(
++        default="iNova",
++        description=(
++            "Organization name used in LLM system prompts (white-label; story 3.3)."
++        ),
++    )
++    artifact_access_token: str | None = Field(
++        default=None,
++        description=(
++            "Optional shared secret (FR32 / NFR-S2). When set, CLI commands that read "
++            "run history or execute the pipeline require PHARMA_RD_CLI_ACCESS_TOKEN "
++            "to match (constant-time compare). Unset = no guard. Never commit real "
++            "values (NFR-S1)."
++        ),
++    )
++
++    @field_validator("openai_api_key", mode="before")
++    @classmethod
++    def empty_openai_api_key_is_none(cls, v: object) -> str | None:
++        if v is None:
++            return None
++        s = str(v).strip()
++        return None if not s else s
++
++    @field_validator("openai_model", mode="before")
++    @classmethod
++    def openai_model_stripped(cls, v: object) -> str:
++        s = str(v).strip() if v is not None else "gpt-4o"
++        return s or "gpt-4o"
++
++    @field_validator("insight_org_display_name", mode="before")
++    @classmethod
++    def insight_org_display_name_stripped(cls, v: object) -> str:
++        if v is None:
++            return "iNova"
++        s = str(v).strip()
++        return s if s else "iNova"
++
++    @field_validator("artifact_access_token", mode="before")
++    @classmethod
++    def empty_artifact_access_token_is_none(cls, v: object) -> str | None:
++        if v is None:
++            return None
++        s = str(v).strip()
++        return None if not s else s
++
++    @field_validator("artifact_access_token", mode="after")
++    @classmethod
++    def artifact_access_token_max_len(cls, v: str | None) -> str | None:
++        if v is None:
++            return None
++        if len(v) > 8192:
++            raise ValueError(
++                "PHARMA_RD_ARTIFACT_ACCESS_TOKEN exceeds max length 8192 "
++                "(FR32 / story 8.5)."
++            )
++        return v
+ 
+     @field_validator("connector_probe_url", mode="before")
+     @classmethod
+@@ -195,6 +513,46 @@ class Settings(BaseSettings):
+         s = str(v).strip()
+         return None if not s else s
+ 
++    @field_validator("consumer_feedback_path", mode="before")
++    @classmethod
++    def empty_consumer_feedback_path_is_none(cls, v: object) -> str | None:
++        if v is None:
++            return None
++        s = str(v).strip()
++        return None if not s else s
++
++    @field_validator("pharmacy_sales_path", mode="before")
++    @classmethod
++    def empty_pharmacy_sales_path_is_none(cls, v: object) -> str | None:
++        if v is None:
++            return None
++        s = str(v).strip()
++        return None if not s else s
++
++    @field_validator("unmet_need_demand_path", mode="before")
++    @classmethod
++    def empty_unmet_need_demand_path_is_none(cls, v: object) -> str | None:
++        if v is None:
++            return None
++        s = str(v).strip()
++        return None if not s else s
++
++    @field_validator("distribution_drop_dir", mode="before")
++    @classmethod
++    def empty_distribution_drop_dir_is_none(cls, v: object) -> str | None:
++        if v is None:
++            return None
++        s = str(v).strip()
++        return None if not s else s
++
++    @field_validator("slack_webhook_url", mode="before")
++    @classmethod
++    def empty_slack_webhook_url_is_none(cls, v: object) -> str | None:
++        if v is None:
++            return None
++        s = str(v).strip()
++        return None if not s else s
++
+     @field_validator("scheduler_timezone", mode="before")
+     @classmethod
+     def scheduler_timezone_must_be_iana(cls, v: object) -> str:
+@@ -209,6 +567,16 @@ class Settings(BaseSettings):
+             ) from e
+         return s
+ 
++    @field_validator("deployment_profile", mode="before")
++    @classmethod
++    def deployment_profile_normalized(cls, v: object) -> str:
++        if v is None:
++            return "practice"
++        s = str(v).strip().lower()
++        if not s:
++            return "practice"
++        return s
++
+     @field_validator("log_level", mode="before")
+     @classmethod
+     def log_level_must_be_std_name(cls, v: object) -> str:
+@@ -222,6 +590,46 @@ class Settings(BaseSettings):
+             )
+         return s
+ 
++    @field_validator("therapeutic_areas", mode="after")
++    @classmethod
++    def therapeutic_areas_validated(cls, v: str) -> str:
++        return _normalize_and_validate_therapeutic_areas(v)
++
++    @field_validator("competitor_watchlist", mode="after")
++    @classmethod
++    def competitor_watchlist_validated(cls, v: str) -> str:
++        return _normalize_and_validate_competitor_watchlist(v)
++
++    @field_validator("pubmed_eutils_base", mode="after")
++    @classmethod
++    def pubmed_eutils_base_is_http_url(cls, v: str) -> str:
++        return _validate_http_url(v, "PHARMA_RD_PUBMED_EUTILS_BASE")
++
++    @field_validator("openfda_drugsfda_url", mode="after")
++    @classmethod
++    def openfda_drugsfda_url_is_http_url(cls, v: str) -> str:
++        return _validate_http_url(v, "PHARMA_RD_OPENFDA_DRUGSFDA_URL")
++
++    @field_validator("connector_probe_url", mode="after")
++    @classmethod
++    def connector_probe_url_is_http_url(cls, v: str | None) -> str | None:
++        if v is None:
++            return None
++        return _validate_http_url(v, "PHARMA_RD_CONNECTOR_PROBE_URL")
++
++    @field_validator("slack_webhook_url", mode="after")
++    @classmethod
++    def slack_webhook_url_is_https(cls, v: str | None) -> str | None:
++        if v is None:
++            return None
++        s = _validate_http_url(v, "PHARMA_RD_SLACK_WEBHOOK_URL")
++        if not s.lower().startswith("https:"):
++            raise ValueError(
++                "PHARMA_RD_SLACK_WEBHOOK_URL must use https:// "
++                "(NFR-S1 / story 8.3)."
++            )
++        return s
++
+     def therapeutic_area_labels(self) -> list[str]:
+         """Non-empty stripped labels from ``therapeutic_areas``."""
+         if not self.therapeutic_areas.strip():
+@@ -239,9 +647,7 @@ class Settings(BaseSettings):
+         if not self.pipeline_disclosure_scopes.strip():
+             return []
+         return [
+-            p.strip()
+-            for p in self.pipeline_disclosure_scopes.split(",")
+-            if p.strip()
++            p.strip() for p in self.pipeline_disclosure_scopes.split(",") if p.strip()
+         ]
+ 
+ 
+diff --git a/pharma_rd/pharma_rd/integrations/openai_client.py b/pharma_rd/pharma_rd/integrations/openai_client.py
+new file mode 100644
+index 0000000..8ece044
+--- /dev/null
++++ b/pharma_rd/pharma_rd/integrations/openai_client.py
+@@ -0,0 +1,74 @@
++"""Shared OpenAI SDK wiring for GPT enrichment steps (stories 3.3, 4.4+)."""
++
++from __future__ import annotations
++
++from openai import (
++    APIConnectionError,
++    APIStatusError,
++    APITimeoutError,
++    OpenAI,
++    RateLimitError,
++)
++
++from pharma_rd.config import Settings
++
++
++def create_openai_client(settings: Settings) -> OpenAI:
++    """Instantiate OpenAI client with API key and timeout from settings."""
++    key = settings.openai_api_key
++    if not key:
++        raise ValueError("openai_api_key is required to create OpenAI client")
++    return OpenAI(api_key=key, timeout=settings.openai_timeout_seconds)
++
++
++def create_openai_client_for_synthesis(settings: Settings) -> OpenAI:
++    """OpenAI client using synthesis-specific timeout (story 6.5 / NFR-P1)."""
++    key = settings.openai_api_key
++    if not key:
++        raise ValueError("openai_api_key is required to create OpenAI client")
++    return OpenAI(
++        api_key=key,
++        timeout=settings.openai_synthesis_timeout_seconds,
++    )
++
++
++def create_openai_client_for_report_delivery(settings: Settings) -> OpenAI:
++    """OpenAI client for GPT report delivery (story 7.6 / NFR-P1)."""
++    key = settings.openai_api_key
++    if not key:
++        raise ValueError("openai_api_key is required to create OpenAI client")
++    return OpenAI(
++        api_key=key,
++        timeout=settings.openai_report_delivery_timeout_seconds,
++    )
++
++
++def run_chat_json_completion(
++    client: OpenAI,
++    *,
++    model: str,
++    system: str,
++    user_content: str,
++) -> tuple[str | None, str | None]:
++    """Call chat.completions with JSON object format; return (content, err)."""
++    try:
++        resp = client.chat.completions.create(
++            model=model,
++            messages=[
++                {"role": "system", "content": system},
++                {"role": "user", "content": user_content},
++            ],
++            response_format={"type": "json_object"},
++        )
++    except (APIConnectionError, APITimeoutError, RateLimitError, APIStatusError) as e:
++        return None, f"{type(e).__name__}: {e}"
++    except Exception as e:
++        return None, f"{type(e).__name__}: {e}"
++
++    if not resp.choices:
++        return None, "no_completion_choices"
++
++    choice = resp.choices[0].message.content
++    if not choice or not choice.strip():
++        return None, "empty_model_response"
++    return choice, None
+diff --git a/pharma_rd/pharma_rd/integrations/openai_report_delivery.py b/pharma_rd/pharma_rd/integrations/openai_report_delivery.py
+new file mode 100644
+index 0000000..de94805
+--- /dev/null
++++ b/pharma_rd/pharma_rd/integrations/openai_report_delivery.py
+@@ -0,0 +1,128 @@
++"""OpenAI GPT insight report HTML + Markdown (story 7.6 / FR18, FR22)."""
++
++from __future__ import annotations
++
++import json
++from dataclasses import dataclass
++
++from pydantic import BaseModel, ConfigDict, ValidationError
++
++from pharma_rd.config import Settings
++from pharma_rd.integrations.openai_client import (
++    create_openai_client_for_report_delivery,
++    run_chat_json_completion,
++)
++from pharma_rd.pipeline.contracts import SynthesisOutput
++
++_SYSTEM_PROMPT = (
++    "You are a senior pharmaceutical strategy consultant writing for {org}. "
++    "Produce a CEO-ready insight report from the structured synthesis JSON. "
++    "Respond with a single JSON object only, keys exactly: "
++    '"report_html" (string), "report_markdown" (string), '
++    '"slack_executive_excerpt" (string, optional, <=600 chars). '
++    "report_html MUST be an HTML **fragment for the document body only** "
++    "(no <!DOCTYPE>, no html/head/body wrapper): semantic sections with "
++    "<section>, <article>, <h1>–<h3>, <p> (continuous prose for the executive "
++    "summary—not bullet-only), narrative paragraphs for each ranked opportunity "
++    "(use data from synthesis.ranked_opportunities), and a commercially framed "
++    "conclusion section. "
++    "Do not use <script> or inline event handlers. Prefer semantic tags; "
++    "you may use limited inline style attributes for typography. "
++    "You MUST include these exact compliance phrases verbatim in report_html "
++    "and report_markdown: "
++    "Executive: \"Human judgment (FR22): Items in this report are recommendations "
++    "for review only—not approvals. Pursuit and portfolio decisions remain "
++    "human-owned.\" "
++    "Per opportunity: \"Recommendation only—not an approval. Pursuit is a human "
++    "decision.\" "
++    "Governance section must echo FR22 pursuit/governance themes from the product "
++    "baseline. "
++    "report_markdown must mirror report_html content as GitHub-flavored Markdown "
++    "(headings, prose, fenced code only when needed). "
++    "slack_executive_excerpt: one short prose blurb for chat notifications."
++)
++
++
++class GptReportDeliveryJson(BaseModel):
++    """Model JSON object from OpenAI (story 7.6)."""
++
++    model_config = ConfigDict(extra="forbid")
++
++    report_html: str = ""
++    report_markdown: str = ""
++    slack_executive_excerpt: str = ""
++
++
++@dataclass(frozen=True)
++class GptReportDeliveryResult:
++    report_html_fragment: str
++    report_markdown: str
++    slack_executive_excerpt: str
++
++
++def _user_payload(
++    settings: Settings,
++    run_id: str,
++    synthesis: SynthesisOutput,
++) -> str:
++    payload = {
++        "run_id": run_id,
++        "synthesis": synthesis.model_dump(mode="json"),
++        "therapeutic_area_labels": settings.therapeutic_area_labels(),
++        "competitor_watchlist_labels": settings.competitor_labels(),
++        "insight_org_display_name": settings.insight_org_display_name,
++        "deployment_profile": settings.deployment_profile,
++    }
++    return json.dumps(payload, ensure_ascii=False)
++
++
++def call_gpt_report_delivery(
++    settings: Settings,
++    run_id: str,
++    synthesis: SynthesisOutput,
++) -> tuple[GptReportDeliveryResult | None, str | None]:
++    """Call OpenAI; return (result, None) or (None, operator_error)."""
++    if not settings.openai_api_key:
++        return None, "missing_api_key"
++
++    client = create_openai_client_for_report_delivery(settings)
++    system = _SYSTEM_PROMPT.format(org=settings.insight_org_display_name)
++    user_content = _user_payload(settings, run_id, synthesis)
++    choice, err = run_chat_json_completion(
++        client,
++        model=settings.openai_model,
++        system=system,
++        user_content=user_content,
++    )
++    if err:
++        return None, err
++    if not choice or not choice.strip():
++        return None, "empty_model_response"
++
++    try:
++        data = json.loads(choice)
++    except json.JSONDecodeError as e:
++        return None, f"json_decode: {e}"
++
++    try:
++        parsed = GptReportDeliveryJson.model_validate(data)
++    except ValidationError as e:
++        return None, f"validate: {e}"
++
++    frag = (parsed.report_html or "").strip()
++    md = (parsed.report_markdown or "").strip()
++    if not frag and not md:
++        return None, "empty_report_fields"
++
++    excerpt = (parsed.slack_executive_excerpt or "").strip()
++    if len(excerpt) > 600:
++        excerpt = excerpt[:599] + "…"
++
++    return (
++        GptReportDeliveryResult(
++            report_html_fragment=frag or "<p></p>",
++            report_markdown=md or "(empty)",
++            slack_executive_excerpt=excerpt,
++        ),
++        None,
++    )
+diff --git a/pharma_rd/pharma_rd/integrations/report_html_sanitize.py b/pharma_rd/pharma_rd/integrations/report_html_sanitize.py
+new file mode 100644
+index 0000000..97514bc
+--- /dev/null
++++ b/pharma_rd/pharma_rd/integrations/report_html_sanitize.py
+@@ -0,0 +1,15 @@
++"""Sanitize GPT-produced HTML before writing report.html (story 7.6 / NFR-S1)."""
++
++from __future__ import annotations
++
++import nh3
++
++
++def sanitize_report_html_fragment(fragment: str) -> str:
++    """Allowlist-based sanitization via **nh3** (Rust ammonia bindings).
++
++    Strips ``script``, event handlers, and disallowed tags. Safe for local
++    ``file://`` viewing when combined with a trusted document shell in
++    ``delivery.py``.
++    """
++    return nh3.clean(fragment.strip() or "<p></p>")
+diff --git a/pharma_rd/pharma_rd/integrations/slack_insight_notification.py b/pharma_rd/pharma_rd/integrations/slack_insight_notification.py
+new file mode 100644
+index 0000000..8bf2be0
+--- /dev/null
++++ b/pharma_rd/pharma_rd/integrations/slack_insight_notification.py
+@@ -0,0 +1,340 @@
++"""Slack Block Kit notifications after insight report delivery (Epic 7 / FR19).
++
++Uses ``httpx`` POST to an incoming webhook URL. Block assembly stays here; Delivery
++orchestrates only. Does not import ``pharma_rd.agents.delivery`` (avoid cycles).
++"""
++
++from __future__ import annotations
++
++import logging
++from datetime import UTC, date, datetime
++from pathlib import Path
++from typing import TYPE_CHECKING, Any
++from urllib.parse import urlparse
++
++import httpx
++
++from pharma_rd.config import Settings
++
++if TYPE_CHECKING:
++    from pharma_rd.pipeline.contracts import SlackNotifyStatus, SynthesisOutput
++
++# Mirror FR22 tone from ``delivery.py`` (single legal meaning; Slack-sized).
++_FR22_SLACK = (
++    "Items in this report are *recommendations* for review only—not *approvals*. "
++    "*Pursuit and portfolio decisions remain human-owned* (FR22)."
++)
++
++# Slack ``section`` mrkdwn practical caps (Block Kit allows 3000; stay smaller).
++_CAP_RATIONALE = 220
++_CAP_COMMERCIAL = 140
++_CAP_FALLBACK_TEXT = 3500
++
++
++def format_report_location_for_notification(
++    artifact_root: Path,
++    run_id: str,
++    *,
++    base_url: str | None = None,
++) -> str:
++    """Where to open the HTML report: filesystem path (MVP) or future HTTPS URL.
++
++    When ``base_url`` is set (e.g. ``https://reports.example.com``), returns a URL
++    path under that base without changing Block Kit assembly elsewhere.
++    """
++    rel = f"{run_id}/delivery/report.html"
++    if base_url is not None:
++        b = base_url.strip().rstrip("/")
++        return f"{b}/{rel}"
++    rel_path = Path(run_id) / "delivery" / "report.html"
++    resolved = (artifact_root.expanduser().resolve() / rel_path).resolve()
++    return str(resolved)
++
++
++def _truncate_at_word(text: str, max_len: int) -> str:
++    t = text.strip().replace("\n", " ")
++    if len(t) <= max_len:
++        return t
++    cut = t[: max_len - 1]
++    if " " in cut:
++        cut = cut.rsplit(" ", 1)[0]
++    return cut + "…"
++
++
++def _escape_slack_mrkdwn_user_text(text: str) -> str:
++    """Escape user/config strings embedded in Slack mrkdwn section text."""
++    t = text.replace("\\", "\\\\")
++    t = t.replace("&", "&amp;")
++    t = t.replace("<", "&lt;")
++    t = t.replace(">", "&gt;")
++    t = t.replace("*", "\\*")
++    t = t.replace("_", "\\_")
++    t = t.replace("~", "\\~")
++    t = t.replace("`", "\\`")
++    return t
++
++
++def _signal_summary_md(sig: str) -> str:
++    if sig == "quiet":
++        return (
++            "Executive view: this run looks like a *quiet week*—limited new "
++            "cross-domain signal versus a high-activity week. Open the full report "
++            "for nuance."
++        )
++    if sig == "net_new":
++        return (
++            "Executive view: *high-signal week*—characterization *net_new* suggests "
++            "notable new threads worth review."
++        )
++    if sig == "mixed":
++        return (
++            "Executive view: *mixed* signal week—some domains may be quiet while "
++            "others show activity; see ranked items below."
++        )
++    return (
++        "Executive view: characterization *unknown*—use the full HTML report for "
++        "complete context."
++    )
++
++
++def _webhook_host_for_log(url: str) -> str:
++    host = urlparse(url).hostname
++    return host if host else "unknown"
++
++
++def build_slack_insight_blocks(
++    *,
++    run_id: str,
++    run_date_utc: date,
++    synthesis: SynthesisOutput,
++    settings: Settings,
++    artifact_root: Path,
++    gpt_executive_excerpt: str | None = None,
++) -> tuple[list[dict[str, Any]], str]:
++    """Return Block Kit ``blocks`` and a plain ``text`` fallback for Slack clients."""
++
++    blocks: list[dict[str, Any]] = []
++
++    blocks.append(
++        {
++            "type": "header",
++            "text": {
++                "type": "plain_text",
++                "text": "pharma_RD insight report",
++                "emoji": True,
++            },
++        }
++    )
++    blocks.append(
++        {
++            "type": "section",
++            "text": {
++                "type": "mrkdwn",
++                "text": f"*Run date (UTC):* {run_date_utc.isoformat()}\n"
++                f"*Run ID:* `{_escape_slack_mrkdwn_user_text(run_id)}`",
++            },
++        }
++    )
++    blocks.append({"type": "divider"})
++    if gpt_executive_excerpt and gpt_executive_excerpt.strip():
++        exc = _truncate_at_word(gpt_executive_excerpt.strip(), 900)
++        exec_md = "*Executive summary*\n" + _escape_slack_mrkdwn_user_text(exc)
++    else:
++        exec_md = "*Executive summary*\n" + _signal_summary_md(
++            synthesis.signal_characterization
++        )
++    blocks.append(
++        {
++            "type": "section",
++            "text": {
++                "type": "mrkdwn",
++                "text": exec_md,
++            },
++        }
++    )
++    blocks.append({"type": "divider"})
++
++    ranked = sorted(
++        synthesis.ranked_opportunities,
++        key=lambda r: (r.rank, r.title),
++    )[:3]
++    opp_lines: list[str] = ["*Top opportunities (by rank)*"]
++    if not ranked:
++        opp_lines.append("_No ranked opportunities in this run._")
++    else:
++        for row in ranked:
++            rat = _escape_slack_mrkdwn_user_text(
++                _truncate_at_word(row.rationale_short, _CAP_RATIONALE)
++            )
++            comm = _escape_slack_mrkdwn_user_text(
++                _truncate_at_word(row.commercial_viability or "—", _CAP_COMMERCIAL)
++            )
++            title_safe = _escape_slack_mrkdwn_user_text(row.title)
++            opp_lines.append(
++                f"*{row.rank}.* {title_safe}\n"
++                f"Rationale: {rat}\n"
++                f"Commercial viability: {comm}"
++            )
++    blocks.append(
++        {
++            "type": "section",
++            "text": {"type": "mrkdwn", "text": "\n\n".join(opp_lines)},
++        }
++    )
++    blocks.append({"type": "divider"})
++
++    tas = settings.therapeutic_area_labels()
++    comps = settings.competitor_labels()
++    ta_part = (
++        ", ".join(f"*{_escape_slack_mrkdwn_user_text(t)}*" for t in tas)
++        if tas
++        else "*not configured* / none"
++    )
++    co_part = (
++        ", ".join(f"*{_escape_slack_mrkdwn_user_text(c)}*" for c in comps)
++        if comps
++        else "*not configured* / none"
++    )
++    blocks.append(
++        {
++            "type": "section",
++            "text": {
++                "type": "mrkdwn",
++                "text": (
++                    "*Scan / monitoring summary*\n"
++                    f"• Therapeutic areas: {ta_part}\n"
++                    f"• Competitor watchlists: {co_part}"
++                ),
++            },
++        }
++    )
++    blocks.append({"type": "divider"})
++    blocks.append(
++        {
++            "type": "section",
++            "text": {
++                "type": "mrkdwn",
++                "text": "*Human judgment (FR22)*\n" + _FR22_SLACK,
++            },
++        }
++    )
++    blocks.append({"type": "divider"})
++    loc = format_report_location_for_notification(artifact_root, run_id, base_url=None)
++    loc_safe = _escape_slack_mrkdwn_user_text(loc)
++    blocks.append(
++        {
++            "type": "section",
++            "text": {
++                "type": "mrkdwn",
++                "text": f"*Full HTML report:*\n`{loc_safe}`",
++            },
++        }
++    )
++
++    fallback = (
++        f"pharma_RD insight report — {run_date_utc.isoformat()} UTC — run {run_id}. "
++        f"Open HTML: {loc}"
++    )
++    if len(fallback) > _CAP_FALLBACK_TEXT:
++        fallback = fallback[: _CAP_FALLBACK_TEXT - 1] + "…"
++    return blocks, fallback
++
++
++def send_slack_insight_notification(
++    *,
++    webhook_url: str | None,
++    run_id: str,
++    synthesis: SynthesisOutput,
++    settings: Settings,
++    artifact_root: Path,
++    logger: logging.Logger,
++    timeout_seconds: float,
++    gpt_executive_excerpt: str | None = None,
++) -> tuple[SlackNotifyStatus, str]:
++    """POST Block Kit payload to Slack, or skip with structured INFO log."""
++
++    if not webhook_url:
++        logger.info(
++            "slack notify skipped",
++            extra={
++                "event": "slack_notify_skipped",
++                "outcome": "skipped",
++                "slack_notify_status": "skipped",
++                "slack_webhook_configured": False,
++            },
++        )
++        return "skipped", ""
++
++    run_date_utc = datetime.now(UTC).date()
++    blocks, text_fb = build_slack_insight_blocks(
++        run_id=run_id,
++        run_date_utc=run_date_utc,
++        synthesis=synthesis,
++        settings=settings,
++        artifact_root=artifact_root,
++        gpt_executive_excerpt=gpt_executive_excerpt,
++    )
++    payload: dict[str, Any] = {"text": text_fb, "blocks": blocks}
++    host = _webhook_host_for_log(webhook_url)
++
++    try:
++        timeout = httpx.Timeout(timeout_seconds)
++        with httpx.Client(timeout=timeout, follow_redirects=True) as client:
++            resp = client.post(webhook_url, json=payload)
++        if 200 <= resp.status_code < 300:
++            logger.info(
++                "slack notify complete",
++                extra={
++                    "event": "slack_notify_complete",
++                    "outcome": "ok",
++                    "slack_notify_status": "ok",
++                    "slack_webhook_configured": True,
++                    "slack_webhook_host": host,
++                    "http_status": resp.status_code,
++                },
++            )
++            return "ok", f"http_status={resp.status_code}"
++        detail = f"http_status={resp.status_code}"
++        logger.error(
++            "slack notify failed",
++            extra={
++                "event": "slack_notify_failed",
++                "outcome": "failed",
++                "slack_notify_status": "failed",
++                "slack_webhook_configured": True,
++                "slack_webhook_host": host,
++                "http_status": resp.status_code,
++                "slack_notify_detail": detail[:300],
++            },
++        )
++        return "failed", detail
++    except httpx.TimeoutException:
++        detail = "timeout"
++        logger.error(
++            "slack notify failed",
++            extra={
++                "event": "slack_notify_failed",
++                "outcome": "failed",
++                "slack_notify_status": "failed",
++                "slack_webhook_configured": True,
++                "slack_webhook_host": host,
++                "error_type": "timeout",
++                "slack_notify_detail": detail,
++            },
++        )
++        return "failed", detail
++    except httpx.RequestError as e:
++        detail = "request_error"
++        logger.error(
++            "slack notify failed",
++            extra={
++                "event": "slack_notify_failed",
++                "outcome": "failed",
++                "slack_notify_status": "failed",
++                "slack_webhook_configured": True,
++                "slack_webhook_host": host,
++                "error_type": type(e).__name__,
++                "slack_notify_detail": detail,
++            },
++        )
++        return "failed", detail
+diff --git a/pharma_rd/pyproject.toml b/pharma_rd/pyproject.toml
+index 7f1932e..88b8faa 100644
+--- a/pharma_rd/pyproject.toml
++++ b/pharma_rd/pyproject.toml
+@@ -10,6 +10,8 @@ requires-python = ">=3.12"
+ dependencies = [
+     "apscheduler>=3.10.0",
+     "httpx>=0.28.1",
++    "nh3>=0.3.4",
++    "openai>=1.59.0",
+     "pydantic>=2.12.5",
+     "pydantic-settings>=2.11.0",
+ ]
+diff --git a/pharma_rd/uv.lock b/pharma_rd/uv.lock
+index d0a3a0f..c0af879 100644
+--- a/pharma_rd/uv.lock
++++ b/pharma_rd/uv.lock
+@@ -54,6 +54,15 @@ wheels = [
+     { url = "https://files.pythonhosted.org/packages/d1/d6/3965ed04c63042e047cb6a3e6ed1a63a35087b6a609aa3a15ed8ac56c221/colorama-0.4.6-py2.py3-none-any.whl", hash = "sha256:4f1d9991f5acc0ca119f9d443620b77f9d6b33703e51011c16baf57afb285fc6", size = 25335, upload-time = "2022-10-25T02:36:20.889Z" },
+ ]
+ 
++[[package]]
++name = "distro"
++version = "1.9.0"
++source = { registry = "https://pypi.org/simple" }
++sdist = { url = "https://files.pythonhosted.org/packages/fc/f8/98eea607f65de6527f8a2e8885fc8015d3e6f5775df186e443e0964a11c3/distro-1.9.0.tar.gz", hash = "sha256:2fa77c6fd8940f116ee1d6b94a2f90b13b5ea8d019b98bc8bafdcabcdd9bdbed", size = 60722, upload-time = "2023-12-24T09:54:32.31Z" }
++wheels = [
++    { url = "https://files.pythonhosted.org/packages/12/b3/231ffd4ab1fc9d679809f356cebee130ac7daa00d6d6f3206dd4fd137e9e/distro-1.9.0-py3-none-any.whl", hash = "sha256:7bffd925d65168f85027d8da9af6bddab658135b840670a223589bc0c8ef02b2", size = 20277, upload-time = "2023-12-24T09:54:30.421Z" },
++]
++
+ [[package]]
+ name = "h11"
+ version = "0.16.0"
+@@ -109,6 +118,127 @@ wheels = [
+     { url = "https://files.pythonhosted.org/packages/cb/b1/3846dd7f199d53cb17f49cba7e651e9ce294d8497c8c150530ed11865bb8/iniconfig-2.3.0-py3-none-any.whl", hash = "sha256:f631c04d2c48c52b84d0d0549c99ff3859c98df65b3101406327ecc7d53fbf12", size = 7484, upload-time = "2025-10-18T21:55:41.639Z" },
+ ]
+ 
++[[package]]
++name = "jiter"
++version = "0.13.0"
++source = { registry = "https://pypi.org/simple" }
++sdist = { url = "https://files.pythonhosted.org/packages/0d/5e/4ec91646aee381d01cdb9974e30882c9cd3b8c5d1079d6b5ff4af522439a/jiter-0.13.0.tar.gz", hash = "sha256:f2839f9c2c7e2dffc1bc5929a510e14ce0a946be9365fd1219e7ef342dae14f4", size = 164847, upload-time = "2026-02-02T12:37:56.441Z" }
++wheels = [
++    { url = "https://files.pythonhosted.org/packages/2e/30/7687e4f87086829955013ca12a9233523349767f69653ebc27036313def9/jiter-0.13.0-cp312-cp312-macosx_10_12_x86_64.whl", hash = "sha256:0a2bd69fc1d902e89925fc34d1da51b2128019423d7b339a45d9e99c894e0663", size = 307958, upload-time = "2026-02-02T12:35:57.165Z" },
++    { url = "https://files.pythonhosted.org/packages/c3/27/e57f9a783246ed95481e6749cc5002a8a767a73177a83c63ea71f0528b90/jiter-0.13.0-cp312-cp312-macosx_11_0_arm64.whl", hash = "sha256:f917a04240ef31898182f76a332f508f2cc4b57d2b4d7ad2dbfebbfe167eb505", size = 318597, upload-time = "2026-02-02T12:35:58.591Z" },
++    { url = "https://files.pythonhosted.org/packages/cf/52/e5719a60ac5d4d7c5995461a94ad5ef962a37c8bf5b088390e6fad59b2ff/jiter-0.13.0-cp312-cp312-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:c1e2b199f446d3e82246b4fd9236d7cb502dc2222b18698ba0d986d2fecc6152", size = 348821, upload-time = "2026-02-02T12:36:00.093Z" },
++    { url = "https://files.pythonhosted.org/packages/61/db/c1efc32b8ba4c740ab3fc2d037d8753f67685f475e26b9d6536a4322bcdd/jiter-0.13.0-cp312-cp312-manylinux_2_17_armv7l.manylinux2014_armv7l.whl", hash = "sha256:04670992b576fa65bd056dbac0c39fe8bd67681c380cb2b48efa885711d9d726", size = 364163, upload-time = "2026-02-02T12:36:01.937Z" },
++    { url = "https://files.pythonhosted.org/packages/55/8a/fb75556236047c8806995671a18e4a0ad646ed255276f51a20f32dceaeec/jiter-0.13.0-cp312-cp312-manylinux_2_17_ppc64le.manylinux2014_ppc64le.whl", hash = "sha256:5a1aff1fbdb803a376d4d22a8f63f8e7ccbce0b4890c26cc7af9e501ab339ef0", size = 483709, upload-time = "2026-02-02T12:36:03.41Z" },
++    { url = "https://files.pythonhosted.org/packages/7e/16/43512e6ee863875693a8e6f6d532e19d650779d6ba9a81593ae40a9088ff/jiter-0.13.0-cp312-cp312-manylinux_2_17_s390x.manylinux2014_s390x.whl", hash = "sha256:3b3fb8c2053acaef8580809ac1d1f7481a0a0bdc012fd7f5d8b18fb696a5a089", size = 370480, upload-time = "2026-02-02T12:36:04.791Z" },
++    { url = "https://files.pythonhosted.org/packages/f8/4c/09b93e30e984a187bc8aaa3510e1ec8dcbdcd71ca05d2f56aac0492453aa/jiter-0.13.0-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:bdaba7d87e66f26a2c45d8cbadcbfc4bf7884182317907baf39cfe9775bb4d93", size = 360735, upload-time = "2026-02-02T12:36:06.994Z" },
++    { url = "https://files.pythonhosted.org/packages/1a/1b/46c5e349019874ec5dfa508c14c37e29864ea108d376ae26d90bee238cd7/jiter-0.13.0-cp312-cp312-manylinux_2_5_i686.manylinux1_i686.whl", hash = "sha256:7b88d649135aca526da172e48083da915ec086b54e8e73a425ba50999468cc08", size = 391814, upload-time = "2026-02-02T12:36:08.368Z" },
++    { url = "https://files.pythonhosted.org/packages/15/9e/26184760e85baee7162ad37b7912797d2077718476bf91517641c92b3639/jiter-0.13.0-cp312-cp312-musllinux_1_1_aarch64.whl", hash = "sha256:e404ea551d35438013c64b4f357b0474c7abf9f781c06d44fcaf7a14c69ff9e2", size = 513990, upload-time = "2026-02-02T12:36:09.993Z" },
++    { url = "https://files.pythonhosted.org/packages/e9/34/2c9355247d6debad57a0a15e76ab1566ab799388042743656e566b3b7de1/jiter-0.13.0-cp312-cp312-musllinux_1_1_x86_64.whl", hash = "sha256:1f4748aad1b4a93c8bdd70f604d0f748cdc0e8744c5547798acfa52f10e79228", size = 548021, upload-time = "2026-02-02T12:36:11.376Z" },
++    { url = "https://files.pythonhosted.org/packages/ac/4a/9f2c23255d04a834398b9c2e0e665382116911dc4d06b795710503cdad25/jiter-0.13.0-cp312-cp312-win32.whl", hash = "sha256:0bf670e3b1445fc4d31612199f1744f67f889ee1bbae703c4b54dc097e5dd394", size = 203024, upload-time = "2026-02-02T12:36:12.682Z" },
++    { url = "https://files.pythonhosted.org/packages/09/ee/f0ae675a957ae5a8f160be3e87acea6b11dc7b89f6b7ab057e77b2d2b13a/jiter-0.13.0-cp312-cp312-win_amd64.whl", hash = "sha256:15db60e121e11fe186c0b15236bd5d18381b9ddacdcf4e659feb96fc6c969c92", size = 205424, upload-time = "2026-02-02T12:36:13.93Z" },
++    { url = "https://files.pythonhosted.org/packages/1b/02/ae611edf913d3cbf02c97cdb90374af2082c48d7190d74c1111dde08bcdd/jiter-0.13.0-cp312-cp312-win_arm64.whl", hash = "sha256:41f92313d17989102f3cb5dd533a02787cdb99454d494344b0361355da52fcb9", size = 186818, upload-time = "2026-02-02T12:36:15.308Z" },
++    { url = "https://files.pythonhosted.org/packages/91/9c/7ee5a6ff4b9991e1a45263bfc46731634c4a2bde27dfda6c8251df2d958c/jiter-0.13.0-cp313-cp313-macosx_10_12_x86_64.whl", hash = "sha256:1f8a55b848cbabf97d861495cd65f1e5c590246fabca8b48e1747c4dfc8f85bf", size = 306897, upload-time = "2026-02-02T12:36:16.748Z" },
++    { url = "https://files.pythonhosted.org/packages/7c/02/be5b870d1d2be5dd6a91bdfb90f248fbb7dcbd21338f092c6b89817c3dbf/jiter-0.13.0-cp313-cp313-macosx_11_0_arm64.whl", hash = "sha256:f556aa591c00f2c45eb1b89f68f52441a016034d18b65da60e2d2875bbbf344a", size = 317507, upload-time = "2026-02-02T12:36:18.351Z" },
++    { url = "https://files.pythonhosted.org/packages/da/92/b25d2ec333615f5f284f3a4024f7ce68cfa0604c322c6808b2344c7f5d2b/jiter-0.13.0-cp313-cp313-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:f7e1d61da332ec412350463891923f960c3073cf1aae93b538f0bb4c8cd46efb", size = 350560, upload-time = "2026-02-02T12:36:19.746Z" },
++    { url = "https://files.pythonhosted.org/packages/be/ec/74dcb99fef0aca9fbe56b303bf79f6bd839010cb18ad41000bf6cc71eec0/jiter-0.13.0-cp313-cp313-manylinux_2_17_armv7l.manylinux2014_armv7l.whl", hash = "sha256:3097d665a27bc96fd9bbf7f86178037db139f319f785e4757ce7ccbf390db6c2", size = 363232, upload-time = "2026-02-02T12:36:21.243Z" },
++    { url = "https://files.pythonhosted.org/packages/1b/37/f17375e0bb2f6a812d4dd92d7616e41917f740f3e71343627da9db2824ce/jiter-0.13.0-cp313-cp313-manylinux_2_17_ppc64le.manylinux2014_ppc64le.whl", hash = "sha256:9d01ecc3a8cbdb6f25a37bd500510550b64ddf9f7d64a107d92f3ccb25035d0f", size = 483727, upload-time = "2026-02-02T12:36:22.688Z" },
++    { url = "https://files.pythonhosted.org/packages/77/d2/a71160a5ae1a1e66c1395b37ef77da67513b0adba73b993a27fbe47eb048/jiter-0.13.0-cp313-cp313-manylinux_2_17_s390x.manylinux2014_s390x.whl", hash = "sha256:ed9bbc30f5d60a3bdf63ae76beb3f9db280d7f195dfcfa61af792d6ce912d159", size = 370799, upload-time = "2026-02-02T12:36:24.106Z" },
++    { url = "https://files.pythonhosted.org/packages/01/99/ed5e478ff0eb4e8aa5fd998f9d69603c9fd3f32de3bd16c2b1194f68361c/jiter-0.13.0-cp313-cp313-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:98fbafb6e88256f4454de33c1f40203d09fc33ed19162a68b3b257b29ca7f663", size = 359120, upload-time = "2026-02-02T12:36:25.519Z" },
++    { url = "https://files.pythonhosted.org/packages/16/be/7ffd08203277a813f732ba897352797fa9493faf8dc7995b31f3d9cb9488/jiter-0.13.0-cp313-cp313-manylinux_2_5_i686.manylinux1_i686.whl", hash = "sha256:5467696f6b827f1116556cb0db620440380434591e93ecee7fd14d1a491b6daa", size = 390664, upload-time = "2026-02-02T12:36:26.866Z" },
++    { url = "https://files.pythonhosted.org/packages/d1/84/e0787856196d6d346264d6dcccb01f741e5f0bd014c1d9a2ebe149caf4f3/jiter-0.13.0-cp313-cp313-musllinux_1_1_aarch64.whl", hash = "sha256:2d08c9475d48b92892583df9da592a0e2ac49bcd41fae1fec4f39ba6cf107820", size = 513543, upload-time = "2026-02-02T12:36:28.217Z" },
++    { url = "https://files.pythonhosted.org/packages/65/50/ecbd258181c4313cf79bca6c88fb63207d04d5bf5e4f65174114d072aa55/jiter-0.13.0-cp313-cp313-musllinux_1_1_x86_64.whl", hash = "sha256:aed40e099404721d7fcaf5b89bd3b4568a4666358bcac7b6b15c09fb6252ab68", size = 547262, upload-time = "2026-02-02T12:36:29.678Z" },
++    { url = "https://files.pythonhosted.org/packages/27/da/68f38d12e7111d2016cd198161b36e1f042bd115c169255bcb7ec823a3bf/jiter-0.13.0-cp313-cp313-win32.whl", hash = "sha256:36ebfbcffafb146d0e6ffb3e74d51e03d9c35ce7c625c8066cdbfc7b953bdc72", size = 200630, upload-time = "2026-02-02T12:36:31.808Z" },
++    { url = "https://files.pythonhosted.org/packages/25/65/3bd1a972c9a08ecd22eb3b08a95d1941ebe6938aea620c246cf426ae09c2/jiter-0.13.0-cp313-cp313-win_amd64.whl", hash = "sha256:8d76029f077379374cf0dbc78dbe45b38dec4a2eb78b08b5194ce836b2517afc", size = 202602, upload-time = "2026-02-02T12:36:33.679Z" },
++    { url = "https://files.pythonhosted.org/packages/15/fe/13bd3678a311aa67686bb303654792c48206a112068f8b0b21426eb6851e/jiter-0.13.0-cp313-cp313-win_arm64.whl", hash = "sha256:bb7613e1a427cfcb6ea4544f9ac566b93d5bf67e0d48c787eca673ff9c9dff2b", size = 185939, upload-time = "2026-02-02T12:36:35.065Z" },
++    { url = "https://files.pythonhosted.org/packages/49/19/a929ec002ad3228bc97ca01dbb14f7632fffdc84a95ec92ceaf4145688ae/jiter-0.13.0-cp313-cp313t-macosx_11_0_arm64.whl", hash = "sha256:fa476ab5dd49f3bf3a168e05f89358c75a17608dbabb080ef65f96b27c19ab10", size = 316616, upload-time = "2026-02-02T12:36:36.579Z" },
++    { url = "https://files.pythonhosted.org/packages/52/56/d19a9a194afa37c1728831e5fb81b7722c3de18a3109e8f282bfc23e587a/jiter-0.13.0-cp313-cp313t-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:ade8cb6ff5632a62b7dbd4757d8c5573f7a2e9ae285d6b5b841707d8363205ef", size = 346850, upload-time = "2026-02-02T12:36:38.058Z" },
++    { url = "https://files.pythonhosted.org/packages/36/4a/94e831c6bf287754a8a019cb966ed39ff8be6ab78cadecf08df3bb02d505/jiter-0.13.0-cp313-cp313t-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:9950290340acc1adaded363edd94baebcee7dabdfa8bee4790794cd5cfad2af6", size = 358551, upload-time = "2026-02-02T12:36:39.417Z" },
++    { url = "https://files.pythonhosted.org/packages/a2/ec/a4c72c822695fa80e55d2b4142b73f0012035d9fcf90eccc56bc060db37c/jiter-0.13.0-cp313-cp313t-win_amd64.whl", hash = "sha256:2b4972c6df33731aac0742b64fd0d18e0a69bc7d6e03108ce7d40c85fd9e3e6d", size = 201950, upload-time = "2026-02-02T12:36:40.791Z" },
++    { url = "https://files.pythonhosted.org/packages/b6/00/393553ec27b824fbc29047e9c7cd4a3951d7fbe4a76743f17e44034fa4e4/jiter-0.13.0-cp313-cp313t-win_arm64.whl", hash = "sha256:701a1e77d1e593c1b435315ff625fd071f0998c5f02792038a5ca98899261b7d", size = 185852, upload-time = "2026-02-02T12:36:42.077Z" },
++    { url = "https://files.pythonhosted.org/packages/6e/f5/f1997e987211f6f9bd71b8083047b316208b4aca0b529bb5f8c96c89ef3e/jiter-0.13.0-cp314-cp314-macosx_10_12_x86_64.whl", hash = "sha256:cc5223ab19fe25e2f0bf2643204ad7318896fe3729bf12fde41b77bfc4fafff0", size = 308804, upload-time = "2026-02-02T12:36:43.496Z" },
++    { url = "https://files.pythonhosted.org/packages/cd/8f/5482a7677731fd44881f0204981ce2d7175db271f82cba2085dd2212e095/jiter-0.13.0-cp314-cp314-macosx_11_0_arm64.whl", hash = "sha256:9776ebe51713acf438fd9b4405fcd86893ae5d03487546dae7f34993217f8a91", size = 318787, upload-time = "2026-02-02T12:36:45.071Z" },
++    { url = "https://files.pythonhosted.org/packages/f3/b9/7257ac59778f1cd025b26a23c5520a36a424f7f1b068f2442a5b499b7464/jiter-0.13.0-cp314-cp314-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:879e768938e7b49b5e90b7e3fecc0dbec01b8cb89595861fb39a8967c5220d09", size = 353880, upload-time = "2026-02-02T12:36:47.365Z" },
++    { url = "https://files.pythonhosted.org/packages/c3/87/719eec4a3f0841dad99e3d3604ee4cba36af4419a76f3cb0b8e2e691ad67/jiter-0.13.0-cp314-cp314-manylinux_2_17_armv7l.manylinux2014_armv7l.whl", hash = "sha256:682161a67adea11e3aae9038c06c8b4a9a71023228767477d683f69903ebc607", size = 366702, upload-time = "2026-02-02T12:36:48.871Z" },
++    { url = "https://files.pythonhosted.org/packages/d2/65/415f0a75cf6921e43365a1bc227c565cb949caca8b7532776e430cbaa530/jiter-0.13.0-cp314-cp314-manylinux_2_17_ppc64le.manylinux2014_ppc64le.whl", hash = "sha256:a13b68cd1cd8cc9de8f244ebae18ccb3e4067ad205220ef324c39181e23bbf66", size = 486319, upload-time = "2026-02-02T12:36:53.006Z" },
++    { url = "https://files.pythonhosted.org/packages/54/a2/9e12b48e82c6bbc6081fd81abf915e1443add1b13d8fc586e1d90bb02bb8/jiter-0.13.0-cp314-cp314-manylinux_2_17_s390x.manylinux2014_s390x.whl", hash = "sha256:87ce0f14c6c08892b610686ae8be350bf368467b6acd5085a5b65441e2bf36d2", size = 372289, upload-time = "2026-02-02T12:36:54.593Z" },
++    { url = "https://files.pythonhosted.org/packages/4e/c1/e4693f107a1789a239c759a432e9afc592366f04e901470c2af89cfd28e1/jiter-0.13.0-cp314-cp314-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:0c365005b05505a90d1c47856420980d0237adf82f70c4aff7aebd3c1cc143ad", size = 360165, upload-time = "2026-02-02T12:36:56.112Z" },
++    { url = "https://files.pythonhosted.org/packages/17/08/91b9ea976c1c758240614bd88442681a87672eebc3d9a6dde476874e706b/jiter-0.13.0-cp314-cp314-manylinux_2_5_i686.manylinux1_i686.whl", hash = "sha256:1317fdffd16f5873e46ce27d0e0f7f4f90f0cdf1d86bf6abeaea9f63ca2c401d", size = 389634, upload-time = "2026-02-02T12:36:57.495Z" },
++    { url = "https://files.pythonhosted.org/packages/18/23/58325ef99390d6d40427ed6005bf1ad54f2577866594bcf13ce55675f87d/jiter-0.13.0-cp314-cp314-musllinux_1_1_aarch64.whl", hash = "sha256:c05b450d37ba0c9e21c77fef1f205f56bcee2330bddca68d344baebfc55ae0df", size = 514933, upload-time = "2026-02-02T12:36:58.909Z" },
++    { url = "https://files.pythonhosted.org/packages/5b/25/69f1120c7c395fd276c3996bb8adefa9c6b84c12bb7111e5c6ccdcd8526d/jiter-0.13.0-cp314-cp314-musllinux_1_1_x86_64.whl", hash = "sha256:775e10de3849d0631a97c603f996f518159272db00fdda0a780f81752255ee9d", size = 548842, upload-time = "2026-02-02T12:37:00.433Z" },
++    { url = "https://files.pythonhosted.org/packages/18/05/981c9669d86850c5fbb0d9e62bba144787f9fba84546ba43d624ee27ef29/jiter-0.13.0-cp314-cp314-win32.whl", hash = "sha256:632bf7c1d28421c00dd8bbb8a3bac5663e1f57d5cd5ed962bce3c73bf62608e6", size = 202108, upload-time = "2026-02-02T12:37:01.718Z" },
++    { url = "https://files.pythonhosted.org/packages/8d/96/cdcf54dd0b0341db7d25413229888a346c7130bd20820530905fdb65727b/jiter-0.13.0-cp314-cp314-win_amd64.whl", hash = "sha256:f22ef501c3f87ede88f23f9b11e608581c14f04db59b6a801f354397ae13739f", size = 204027, upload-time = "2026-02-02T12:37:03.075Z" },
++    { url = "https://files.pythonhosted.org/packages/fb/f9/724bcaaab7a3cd727031fe4f6995cb86c4bd344909177c186699c8dec51a/jiter-0.13.0-cp314-cp314-win_arm64.whl", hash = "sha256:07b75fe09a4ee8e0c606200622e571e44943f47254f95e2436c8bdcaceb36d7d", size = 187199, upload-time = "2026-02-02T12:37:04.414Z" },
++    { url = "https://files.pythonhosted.org/packages/62/92/1661d8b9fd6a3d7a2d89831db26fe3c1509a287d83ad7838831c7b7a5c7e/jiter-0.13.0-cp314-cp314t-macosx_11_0_arm64.whl", hash = "sha256:964538479359059a35fb400e769295d4b315ae61e4105396d355a12f7fef09f0", size = 318423, upload-time = "2026-02-02T12:37:05.806Z" },
++    { url = "https://files.pythonhosted.org/packages/4f/3b/f77d342a54d4ebcd128e520fc58ec2f5b30a423b0fd26acdfc0c6fef8e26/jiter-0.13.0-cp314-cp314t-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:e104da1db1c0991b3eaed391ccd650ae8d947eab1480c733e5a3fb28d4313e40", size = 351438, upload-time = "2026-02-02T12:37:07.189Z" },
++    { url = "https://files.pythonhosted.org/packages/76/b3/ba9a69f0e4209bd3331470c723c2f5509e6f0482e416b612431a5061ed71/jiter-0.13.0-cp314-cp314t-manylinux_2_17_armv7l.manylinux2014_armv7l.whl", hash = "sha256:0e3a5f0cde8ff433b8e88e41aa40131455420fb3649a3c7abdda6145f8cb7202", size = 364774, upload-time = "2026-02-02T12:37:08.579Z" },
++    { url = "https://files.pythonhosted.org/packages/b3/16/6cdb31fa342932602458dbb631bfbd47f601e03d2e4950740e0b2100b570/jiter-0.13.0-cp314-cp314t-manylinux_2_17_ppc64le.manylinux2014_ppc64le.whl", hash = "sha256:57aab48f40be1db920a582b30b116fe2435d184f77f0e4226f546794cedd9cf0", size = 487238, upload-time = "2026-02-02T12:37:10.066Z" },
++    { url = "https://files.pythonhosted.org/packages/ed/b1/956cc7abaca8d95c13aa8d6c9b3f3797241c246cd6e792934cc4c8b250d2/jiter-0.13.0-cp314-cp314t-manylinux_2_17_s390x.manylinux2014_s390x.whl", hash = "sha256:7772115877c53f62beeb8fd853cab692dbc04374ef623b30f997959a4c0e7e95", size = 372892, upload-time = "2026-02-02T12:37:11.656Z" },
++    { url = "https://files.pythonhosted.org/packages/26/c4/97ecde8b1e74f67b8598c57c6fccf6df86ea7861ed29da84629cdbba76c4/jiter-0.13.0-cp314-cp314t-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:1211427574b17b633cfceba5040de8081e5abf114f7a7602f73d2e16f9fdaa59", size = 360309, upload-time = "2026-02-02T12:37:13.244Z" },
++    { url = "https://files.pythonhosted.org/packages/4b/d7/eabe3cf46715854ccc80be2cd78dd4c36aedeb30751dbf85a1d08c14373c/jiter-0.13.0-cp314-cp314t-manylinux_2_5_i686.manylinux1_i686.whl", hash = "sha256:7beae3a3d3b5212d3a55d2961db3c292e02e302feb43fce6a3f7a31b90ea6dfe", size = 389607, upload-time = "2026-02-02T12:37:14.881Z" },
++    { url = "https://files.pythonhosted.org/packages/df/2d/03963fc0804e6109b82decfb9974eb92df3797fe7222428cae12f8ccaa0c/jiter-0.13.0-cp314-cp314t-musllinux_1_1_aarch64.whl", hash = "sha256:e5562a0f0e90a6223b704163ea28e831bd3a9faa3512a711f031611e6b06c939", size = 514986, upload-time = "2026-02-02T12:37:16.326Z" },
++    { url = "https://files.pythonhosted.org/packages/f6/6c/8c83b45eb3eb1c1e18d841fe30b4b5bc5619d781267ca9bc03e005d8fd0a/jiter-0.13.0-cp314-cp314t-musllinux_1_1_x86_64.whl", hash = "sha256:6c26a424569a59140fb51160a56df13f438a2b0967365e987889186d5fc2f6f9", size = 548756, upload-time = "2026-02-02T12:37:17.736Z" },
++    { url = "https://files.pythonhosted.org/packages/47/66/eea81dfff765ed66c68fd2ed8c96245109e13c896c2a5015c7839c92367e/jiter-0.13.0-cp314-cp314t-win32.whl", hash = "sha256:24dc96eca9f84da4131cdf87a95e6ce36765c3b156fc9ae33280873b1c32d5f6", size = 201196, upload-time = "2026-02-02T12:37:19.101Z" },
++    { url = "https://files.pythonhosted.org/packages/ff/32/4ac9c7a76402f8f00d00842a7f6b83b284d0cf7c1e9d4227bc95aa6d17fa/jiter-0.13.0-cp314-cp314t-win_amd64.whl", hash = "sha256:0a8d76c7524087272c8ae913f5d9d608bd839154b62c4322ef65723d2e5bb0b8", size = 204215, upload-time = "2026-02-02T12:37:20.495Z" },
++    { url = "https://files.pythonhosted.org/packages/f9/8e/7def204fea9f9be8b3c21a6f2dd6c020cf56c7d5ff753e0e23ed7f9ea57e/jiter-0.13.0-cp314-cp314t-win_arm64.whl", hash = "sha256:2c26cf47e2cad140fa23b6d58d435a7c0161f5c514284802f25e87fddfe11024", size = 187152, upload-time = "2026-02-02T12:37:22.124Z" },
++    { url = "https://files.pythonhosted.org/packages/80/60/e50fa45dd7e2eae049f0ce964663849e897300433921198aef94b6ffa23a/jiter-0.13.0-graalpy312-graalpy250_312_native-macosx_10_12_x86_64.whl", hash = "sha256:3d744a6061afba08dd7ae375dcde870cffb14429b7477e10f67e9e6d68772a0a", size = 305169, upload-time = "2026-02-02T12:37:50.376Z" },
++    { url = "https://files.pythonhosted.org/packages/d2/73/a009f41c5eed71c49bec53036c4b33555afcdee70682a18c6f66e396c039/jiter-0.13.0-graalpy312-graalpy250_312_native-macosx_11_0_arm64.whl", hash = "sha256:ff732bd0a0e778f43d5009840f20b935e79087b4dc65bd36f1cd0f9b04b8ff7f", size = 303808, upload-time = "2026-02-02T12:37:52.092Z" },
++    { url = "https://files.pythonhosted.org/packages/c4/10/528b439290763bff3d939268085d03382471b442f212dca4ff5f12802d43/jiter-0.13.0-graalpy312-graalpy250_312_native-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:ab44b178f7981fcaea7e0a5df20e773c663d06ffda0198f1a524e91b2fde7e59", size = 337384, upload-time = "2026-02-02T12:37:53.582Z" },
++    { url = "https://files.pythonhosted.org/packages/67/8a/a342b2f0251f3dac4ca17618265d93bf244a2a4d089126e81e4c1056ac50/jiter-0.13.0-graalpy312-graalpy250_312_native-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:7bb00b6d26db67a05fe3e12c76edc75f32077fb51deed13822dc648fa373bc19", size = 343768, upload-time = "2026-02-02T12:37:55.055Z" },
++]
++
++[[package]]
++name = "nh3"
++version = "0.3.4"
++source = { registry = "https://pypi.org/simple" }
++sdist = { url = "https://files.pythonhosted.org/packages/4e/86/f8d3a7c9bd1bbaa181f6312c757e0b74d25f71ecf84ea3c0dc5e0f01840d/nh3-0.3.4.tar.gz", hash = "sha256:96709a379997c1b28c8974146ca660b0dcd3794f4f6d50c1ea549bab39ac6ade", size = 19520, upload-time = "2026-03-25T10:57:30.789Z" }
++wheels = [
++    { url = "https://files.pythonhosted.org/packages/fd/5e/c400663d14be2216bc084ed2befc871b7b12563f85d40904f2a4bf0dd2b7/nh3-0.3.4-cp314-cp314t-macosx_10_12_x86_64.macosx_11_0_arm64.macosx_10_12_universal2.whl", hash = "sha256:8b61058f34c2105d44d2a4d4241bacf603a1ef5c143b08766bbd0cf23830118f", size = 1417991, upload-time = "2026-03-25T10:56:59.13Z" },
++    { url = "https://files.pythonhosted.org/packages/36/f5/109526f5002ec41322ac8cafd50f0f154bae0c26b9607c0fcb708bdca8ec/nh3-0.3.4-cp314-cp314t-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:554cc2bab281758e94d770c3fb0bf2d8be5fb403ef6b2e8841dd7c1615df7a0f", size = 790566, upload-time = "2026-03-25T10:57:00.445Z" },
++    { url = "https://files.pythonhosted.org/packages/7b/66/38950f2b4b316ffd82ee51ed8f9143d1f56fdd620312cacc91613b77b3e7/nh3-0.3.4-cp314-cp314t-manylinux_2_5_i686.manylinux1_i686.whl", hash = "sha256:dbe76feaa44e2ef9436f345016012a591550e77818876a8de5c8bc2a248e08df", size = 837538, upload-time = "2026-03-25T10:57:01.848Z" },
++    { url = "https://files.pythonhosted.org/packages/d8/9f/9d6da970e9524fe360ea02a2082856390c2c8ba540409d1be6e5851887b3/nh3-0.3.4-cp314-cp314t-musllinux_1_2_aarch64.whl", hash = "sha256:87dac8d611b4a478400e0821a13b35770e88c266582f065e7249d6a37b0f86e8", size = 1012154, upload-time = "2026-03-25T10:57:03.592Z" },
++    { url = "https://files.pythonhosted.org/packages/54/92/7c85c33c241e9dd51dda115bd3f765e940446588cdaaca62ef8edffe675f/nh3-0.3.4-cp314-cp314t-musllinux_1_2_armv7l.whl", hash = "sha256:8d697e19f2995b337f648204848ac3a528eaafffc39e7ce4ac6b7a2fbe6c84af", size = 1092516, upload-time = "2026-03-25T10:57:04.726Z" },
++    { url = "https://files.pythonhosted.org/packages/16/0f/597842bdb2890999a3faa2f3fcb02db8aa6ad09320d3d843ff6d0a1f737b/nh3-0.3.4-cp314-cp314t-musllinux_1_2_i686.whl", hash = "sha256:7cae217f031809321db962cd7e092bda8d4e95a87f78c0226628fa6c2ea8ebc5", size = 1053793, upload-time = "2026-03-25T10:57:06.171Z" },
++    { url = "https://files.pythonhosted.org/packages/7d/32/669da65147bc10746d2e1d7a8a3dbfbffe0315f419e74b559e2ee3471a01/nh3-0.3.4-cp314-cp314t-musllinux_1_2_x86_64.whl", hash = "sha256:07999b998bf89692738f15c0eac76a416382932f855709e0b7488b595c30ec89", size = 1035975, upload-time = "2026-03-25T10:57:07.292Z" },
++    { url = "https://files.pythonhosted.org/packages/a1/7e/9e97a8b3c5161c79b4bf21cc54e9334860a52cc54ede15bf2239ef494b73/nh3-0.3.4-cp314-cp314t-win32.whl", hash = "sha256:ca90397c8d36c1535bf1988b2bed006597337843a164c7ec269dc8813f37536b", size = 600419, upload-time = "2026-03-25T10:57:08.342Z" },
++    { url = "https://files.pythonhosted.org/packages/e0/c7/6849d8d4295d3997d148eacb2d4b1c9faada4895ee3c1b1e12e72f4611e2/nh3-0.3.4-cp314-cp314t-win_amd64.whl", hash = "sha256:41e46b3499918ab6128b6421677b316e79869d0c140da24069d220a94f4e72d1", size = 613342, upload-time = "2026-03-25T10:57:09.593Z" },
++    { url = "https://files.pythonhosted.org/packages/8b/0e/14a3f510f36c20b922c123a2730f071f938d006fb513aacfd46d6cbc03a7/nh3-0.3.4-cp314-cp314t-win_arm64.whl", hash = "sha256:80b955d802bf365bd42e09f6c3d64567dce777d20e97968d94b3e9d9e99b265e", size = 607025, upload-time = "2026-03-25T10:57:10.959Z" },
++    { url = "https://files.pythonhosted.org/packages/4a/57/a97955bc95960cfb1f0517043d60a121f4ba93fde252d4d9ffd3c2a9eead/nh3-0.3.4-cp38-abi3-macosx_10_12_x86_64.macosx_11_0_arm64.macosx_10_12_universal2.whl", hash = "sha256:d8bebcb20ab4b91858385cd98fe58046ec4a624275b45ef9b976475604f45b49", size = 1439519, upload-time = "2026-03-25T10:57:12.019Z" },
++    { url = "https://files.pythonhosted.org/packages/2b/60/c9a33361da8cde7c7760f091cd10467bc470634e4eea31c8bb70935b00a4/nh3-0.3.4-cp38-abi3-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:0d825722a1e8cbc87d7ca1e47ffb1d2a6cf343ad4c1b8465becf7cadcabcdfd0", size = 833798, upload-time = "2026-03-25T10:57:13.264Z" },
++    { url = "https://files.pythonhosted.org/packages/6b/19/9487790780b8c94eacca37866c1270b747a4af8e244d43b3b550fddbbf62/nh3-0.3.4-cp38-abi3-manylinux_2_17_armv7l.manylinux2014_armv7l.whl", hash = "sha256:4aa8b43e68c26b68069a3b6cef09de166d1d7fa140cf8d77e409a46cbf742e44", size = 820414, upload-time = "2026-03-25T10:57:14.236Z" },
++    { url = "https://files.pythonhosted.org/packages/6b/b4/c6a340dd321d20b1e4a663307032741da045685c87403926c43656f6f5ec/nh3-0.3.4-cp38-abi3-manylinux_2_17_ppc64.manylinux2014_ppc64.whl", hash = "sha256:f5f214618ad5eff4f2a6b13a8d4da4d9e7f37c569d90a13fb9f0caaf7d04fe21", size = 1061531, upload-time = "2026-03-25T10:57:15.384Z" },
++    { url = "https://files.pythonhosted.org/packages/c4/49/f6b4b474e0032e4bcbb7174b44e4cf6915670e09c62421deb06ccfcb88b8/nh3-0.3.4-cp38-abi3-manylinux_2_17_ppc64le.manylinux2014_ppc64le.whl", hash = "sha256:3390e4333883673a684ce16c1716b481e91782d6f56dec5c85fed9feedb23382", size = 1021889, upload-time = "2026-03-25T10:57:16.454Z" },
++    { url = "https://files.pythonhosted.org/packages/43/da/e52a6941746d1f974752af3fc8591f1dbcdcf7fd8c726c7d99f444ba820e/nh3-0.3.4-cp38-abi3-manylinux_2_17_s390x.manylinux2014_s390x.whl", hash = "sha256:18a2e44ccb29cbb45071b8f3f2dab9ebfb41a6516f328f91f1f1fd18196239a4", size = 912965, upload-time = "2026-03-25T10:57:17.624Z" },
++    { url = "https://files.pythonhosted.org/packages/d6/b7/ec1cbc6b297a808c513f59f501656389623fc09ad6a58c640851289c7854/nh3-0.3.4-cp38-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:0961a27dc2057c38d0364cb05880e1997ae1c80220cbc847db63213720b8f304", size = 804975, upload-time = "2026-03-25T10:57:18.994Z" },
++    { url = "https://files.pythonhosted.org/packages/a9/56/b1275aa2c6510191eed76178da4626b0900402439cb9f27d6b9bf7c6d5e9/nh3-0.3.4-cp38-abi3-manylinux_2_31_riscv64.whl", hash = "sha256:9337517edb7c10228252cce2898e20fb3d77e32ffaccbb3c66897927d74215a0", size = 833400, upload-time = "2026-03-25T10:57:20.086Z" },
++    { url = "https://files.pythonhosted.org/packages/7c/a5/5d574ffa3c6e49a5364d1b25ebad165501c055340056671493beb467a15e/nh3-0.3.4-cp38-abi3-manylinux_2_5_i686.manylinux1_i686.whl", hash = "sha256:d866701affe67a5171b916b5c076e767a74c6a9efb7fb2006eb8d3c5f9a293d5", size = 854277, upload-time = "2026-03-25T10:57:21.433Z" },
++    { url = "https://files.pythonhosted.org/packages/79/36/8aeb2ab21517cefa212db109e41024e02650716cb42bf293d0a88437a92d/nh3-0.3.4-cp38-abi3-musllinux_1_2_aarch64.whl", hash = "sha256:47d749d99ae005ab19517224140b280dd56e77b33afb82f9b600e106d0458003", size = 1022021, upload-time = "2026-03-25T10:57:22.433Z" },
++    { url = "https://files.pythonhosted.org/packages/9c/95/9fd860997685e64abe2d5a995ca2eb5004c0fb6d6585429612a7871548b9/nh3-0.3.4-cp38-abi3-musllinux_1_2_armv7l.whl", hash = "sha256:f987cb56458323405e8e5ea827e1befcf141ffa0c0ac797d6d02e6b646056d9a", size = 1103526, upload-time = "2026-03-25T10:57:23.487Z" },
++    { url = "https://files.pythonhosted.org/packages/7d/0d/df545070614c1007f0109bb004230226c9000e7857c9785583ec25cda9d7/nh3-0.3.4-cp38-abi3-musllinux_1_2_i686.whl", hash = "sha256:883d5a6d6ee8078c4afc8e96e022fe579c4c265775ff6ee21e39b8c542cabab3", size = 1068050, upload-time = "2026-03-25T10:57:24.624Z" },
++    { url = "https://files.pythonhosted.org/packages/94/d5/17b016df52df052f714c53be71df26a1943551d9931e9383b92c998b88f8/nh3-0.3.4-cp38-abi3-musllinux_1_2_x86_64.whl", hash = "sha256:75643c22f5092d8e209f766ee8108c400bc1e44760fc94d2d638eb138d18f853", size = 1046037, upload-time = "2026-03-25T10:57:25.799Z" },
++    { url = "https://files.pythonhosted.org/packages/51/39/49f737907e6ab2b4ca71855d3bd63dd7958862e9c8b94fb4e5b18ccf6988/nh3-0.3.4-cp38-abi3-win32.whl", hash = "sha256:72e4e9ca1c4bd41b4a28b0190edc2e21e3f71496acd36a0162858e1a28db3d7e", size = 609542, upload-time = "2026-03-25T10:57:27.112Z" },
++    { url = "https://files.pythonhosted.org/packages/73/4f/af8e9071d7464575a7316831938237ffc9d92d27f163dbdd964b1309cd9b/nh3-0.3.4-cp38-abi3-win_amd64.whl", hash = "sha256:c10b1f0c741e257a5cb2978d6bac86e7c784ab20572724b20c6402c2e24bce75", size = 624244, upload-time = "2026-03-25T10:57:28.302Z" },
++    { url = "https://files.pythonhosted.org/packages/44/0c/37695d6b0168f6714b5c492331636a9e6123d6ec22d25876c68d06eab1b8/nh3-0.3.4-cp38-abi3-win_arm64.whl", hash = "sha256:43ad4eedee7e049b9069bc015b7b095d320ed6d167ecec111f877de1540656e9", size = 616649, upload-time = "2026-03-25T10:57:29.623Z" },
++]
++
++[[package]]
++name = "openai"
++version = "2.30.0"
++source = { registry = "https://pypi.org/simple" }
++dependencies = [
++    { name = "anyio" },
++    { name = "distro" },
++    { name = "httpx" },
++    { name = "jiter" },
++    { name = "pydantic" },
++    { name = "sniffio" },
++    { name = "tqdm" },
++    { name = "typing-extensions" },
++]
++sdist = { url = "https://files.pythonhosted.org/packages/88/15/52580c8fbc16d0675d516e8749806eda679b16de1e4434ea06fb6feaa610/openai-2.30.0.tar.gz", hash = "sha256:92f7661c990bda4b22a941806c83eabe4896c3094465030dd882a71abe80c885", size = 676084, upload-time = "2026-03-25T22:08:59.96Z" }
++wheels = [
++    { url = "https://files.pythonhosted.org/packages/2a/9e/5bfa2270f902d5b92ab7d41ce0475b8630572e71e349b2a4996d14bdda93/openai-2.30.0-py3-none-any.whl", hash = "sha256:9a5ae616888eb2748ec5e0c5b955a51592e0b201a11f4262db920f2a78c5231d", size = 1146656, upload-time = "2026-03-25T22:08:58.2Z" },
++]
++
+ [[package]]
+ name = "packaging"
+ version = "26.0"
+@@ -125,6 +255,8 @@ source = { editable = "." }
+ dependencies = [
+     { name = "apscheduler" },
+     { name = "httpx" },
++    { name = "nh3" },
++    { name = "openai" },
+     { name = "pydantic" },
+     { name = "pydantic-settings" },
+ ]
+@@ -139,6 +271,8 @@ dev = [
+ requires-dist = [
+     { name = "apscheduler", specifier = ">=3.10.0" },
+     { name = "httpx", specifier = ">=0.28.1" },
++    { name = "nh3", specifier = ">=0.3.4" },
++    { name = "openai", specifier = ">=1.59.0" },
+     { name = "pydantic", specifier = ">=2.12.5" },
+     { name = "pydantic-settings", specifier = ">=2.11.0" },
+ ]
+@@ -317,6 +451,27 @@ wheels = [
+     { url = "https://files.pythonhosted.org/packages/03/36/76704c4f312257d6dbaae3c959add2a622f63fcca9d864659ce6d8d97d3d/ruff-0.15.9-py3-none-win_arm64.whl", hash = "sha256:0694e601c028fd97dc5c6ee244675bc241aeefced7ef80cd9c6935a871078f53", size = 11005870, upload-time = "2026-04-02T18:17:15.773Z" },
+ ]
+ 
++[[package]]
++name = "sniffio"
++version = "1.3.1"
++source = { registry = "https://pypi.org/simple" }
++sdist = { url = "https://files.pythonhosted.org/packages/a2/87/a6771e1546d97e7e041b6ae58d80074f81b7d5121207425c964ddf5cfdbd/sniffio-1.3.1.tar.gz", hash = "sha256:f4324edc670a0f49750a81b895f35c3adb843cca46f0530f79fc1babb23789dc", size = 20372, upload-time = "2024-02-25T23:20:04.057Z" }
++wheels = [
++    { url = "https://files.pythonhosted.org/packages/e9/44/75a9c9421471a6c4805dbf2356f7c181a29c1879239abab1ea2cc8f38b40/sniffio-1.3.1-py3-none-any.whl", hash = "sha256:2f6da418d1f1e0fddd844478f41680e794e6051915791a034ff65e5f100525a2", size = 10235, upload-time = "2024-02-25T23:20:01.196Z" },
++]
++
++[[package]]
++name = "tqdm"
++version = "4.67.3"
++source = { registry = "https://pypi.org/simple" }
++dependencies = [
++    { name = "colorama", marker = "sys_platform == 'win32'" },
++]
++sdist = { url = "https://files.pythonhosted.org/packages/09/a9/6ba95a270c6f1fbcd8dac228323f2777d886cb206987444e4bce66338dd4/tqdm-4.67.3.tar.gz", hash = "sha256:7d825f03f89244ef73f1d4ce193cb1774a8179fd96f31d7e1dcde62092b960bb", size = 169598, upload-time = "2026-02-03T17:35:53.048Z" }
++wheels = [
++    { url = "https://files.pythonhosted.org/packages/16/e1/3079a9ff9b8e11b846c6ac5c8b5bfb7ff225eee721825310c91b3b50304f/tqdm-4.67.3-py3-none-any.whl", hash = "sha256:ee1e4c0e59148062281c49d80b25b67771a127c85fc9676d3be5f243206826bf", size = 78374, upload-time = "2026-02-03T17:35:50.982Z" },
++]
++
+ [[package]]
+ name = "typing-extensions"
+ version = "4.15.0"
+diff --git a/pharma_rd/tests/conftest.py b/pharma_rd/tests/conftest.py
+index c6cb95b..a6d166d 100644
+--- a/pharma_rd/tests/conftest.py
++++ b/pharma_rd/tests/conftest.py
+@@ -7,8 +7,10 @@ from pharma_rd.config import get_settings
+ 
+ 
+ @pytest.fixture(autouse=True)
+-def _clear_settings_cache() -> None:
+-    """Isolate tests that mutate PHARMA_RD_* environment variables."""
++def _clear_settings_cache(monkeypatch: pytest.MonkeyPatch) -> None:
++    """Isolate tests; default synthesis to deterministic (no OpenAI key in CI)."""
++    monkeypatch.setenv("PHARMA_RD_SYNTHESIS_MODE", "deterministic")
++    monkeypatch.setenv("PHARMA_RD_REPORT_RENDERER", "template")
+     get_settings.cache_clear()
+     yield
+     get_settings.cache_clear()
+diff --git a/pharma_rd/tests/agents/test_delivery.py b/pharma_rd/tests/agents/test_delivery.py
+new file mode 100644
+index 0000000..185c1bc
+--- /dev/null
++++ b/pharma_rd/tests/agents/test_delivery.py
+@@ -0,0 +1,356 @@
++"""Delivery agent — FR18."""
++
++from __future__ import annotations
++
++import json
++import logging
++from pathlib import Path
++from unittest.mock import MagicMock, patch
++
++import httpx
++import pytest
++from pharma_rd.agents.delivery import run_delivery
++from pharma_rd.config import get_settings
++from pharma_rd.pipeline.contracts import (
++    DomainCoverage,
++    EvidenceReferenceItem,
++    RankedOpportunityItem,
++    SynthesisOutput,
++)
++from pharma_rd.readability import validate_readable_insight_report
++
++
++def test_run_delivery_writes_report_and_output_metadata(
++    tmp_path: Path, caplog: pytest.LogCaptureFixture
++) -> None:
++    caplog.set_level(logging.INFO)
++    rid = "run-7-1"
++    syn = SynthesisOutput(
++        schema_version=5,
++        run_id=rid,
++        signal_characterization="net_new",
++        scan_summary_lines=["Clinical: pubs=1 internal=0 tas=none"],
++        ranked_opportunities=[
++            RankedOpportunityItem(
++                rank=1,
++                title="Clinical: Alpha · Competitor: (no item)",
++                rationale_short="Clinical “Alpha”: more text here.",
++                domain_coverage=DomainCoverage(
++                    clinical=True,
++                    competitor=False,
++                    consumer=False,
++                ),
++                evidence_references=[
++                    EvidenceReferenceItem(
++                        domain="clinical",
++                        label="Alpha",
++                        reference="pmid:99",
++                    )
++                ],
++                commercial_viability="Clinical: cited evidence.",
++            )
++        ],
++    )
++    root = tmp_path / "art"
++    root.mkdir()
++    out = run_delivery(rid, syn, root)
++    assert out.schema_version == 3
++    assert out.report_format == "markdown"
++    assert out.report_byte_size > 0
++    assert out.report_relative_path == f"{rid}/delivery/report.md"
++    assert out.report_html_relative_path == f"{rid}/delivery/report.html"
++    assert out.report_html_byte_size > 0
++    assert out.distribution_channel == "none"
++    assert out.distribution_status == "skipped"
++    assert out.distribution_detail
++    assert out.slack_notify_status == "skipped"
++    assert out.slack_notify_detail == ""
++    assert any(
++        getattr(r, "event", None) == "slack_notify_skipped" for r in caplog.records
++    )
++    report_path = root / rid / "delivery" / "report.md"
++    report = report_path.read_text(encoding="utf-8")
++    assert rid in report
++    assert "net_new" in report
++    assert "Clinical: pubs=1" in report
++    assert "Alpha" in report
++    assert "pmid:99" in report
++    assert "Governance and disclaimer" in report
++    assert "Human judgment (FR22)" in report
++    assert "Deployment (FR26)" in report
++    assert "enterprise sso" in report.lower()
++    assert "recommendation" in report.lower()
++    assert "human-owned" in report.lower()
++    assert "pursuit" in report.lower()
++    assert "Recommendation only—not an approval" in report
++    validate_readable_insight_report(
++        report_path,
++        required_content_snippets=(
++            "Clinical: Alpha · Competitor: (no item)",
++            "pmid:99",
++        ),
++    )
++    html = (root / rid / "delivery" / "report.html").read_text(encoding="utf-8")
++    assert "<h2>Run summary</h2>" in html
++    assert "<h2>Ranked opportunities</h2>" in html
++    assert "<h2>Governance and disclaimer</h2>" in html
++    assert "<footer>" in html
++    assert "Human judgment (FR22)" in html
++    assert "Deployment (FR26)" in html
++    assert "enterprise sso" in html.lower()
++    assert "human-owned" in html.lower()
++    assert "Recommendation only—not an approval" in html
++    assert "Clinical: Alpha" in html
++
++
++def test_run_summary_skips_fr26_banner_when_not_practice_profile(
++    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    monkeypatch.setenv("PHARMA_RD_DEPLOYMENT_PROFILE", "staging")
++    from pharma_rd.config import get_settings
++
++    get_settings.cache_clear()
++    try:
++        rid = "run-8-4-staging"
++        syn = SynthesisOutput(
++            schema_version=5,
++            run_id=rid,
++            signal_characterization="quiet",
++            scan_summary_lines=[],
++            ranked_opportunities=[],
++        )
++        root = tmp_path / "art"
++        root.mkdir()
++        run_delivery(rid, syn, root)
++        report = (root / rid / "delivery" / "report.md").read_text(encoding="utf-8")
++        assert "Deployment (FR26)" not in report
++        html = (root / rid / "delivery" / "report.html").read_text(encoding="utf-8")
++        assert "Deployment (FR26)" not in html
++        validate_readable_insight_report(
++            root / rid / "delivery" / "report.md",
++            required_content_snippets=("quiet",),
++        )
++    finally:
++        get_settings.cache_clear()
++
++
++def test_run_delivery_file_drop_ok(
++    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    from pharma_rd.config import get_settings
++
++    rid = "run-7-2-drop"
++    syn = SynthesisOutput(
++        schema_version=5,
++        run_id=rid,
++        signal_characterization="quiet",
++        scan_summary_lines=["a"],
++        ranked_opportunities=[],
++    )
++    root = tmp_path / "art"
++    root.mkdir()
++    drop = tmp_path / "drop"
++    monkeypatch.setenv("PHARMA_RD_DISTRIBUTION_CHANNEL", "file_drop")
++    monkeypatch.setenv("PHARMA_RD_DISTRIBUTION_DROP_DIR", str(drop))
++    get_settings.cache_clear()
++    try:
++        out = run_delivery(rid, syn, root)
++    finally:
++        get_settings.cache_clear()
++    assert out.schema_version == 3
++    assert out.distribution_channel == "file_drop"
++    assert out.distribution_status == "ok"
++    canonical = root / rid / "delivery" / "report.md"
++    rd_md = drop / "rd" / rid / "report.md"
++    mk_md = drop / "marketing" / rid / "report.md"
++    assert rd_md.is_file()
++    assert mk_md.is_file()
++    blob = canonical.read_bytes()
++    assert rd_md.read_bytes() == blob
++    assert mk_md.read_bytes() == blob
++    validate_readable_insight_report(rd_md, required_content_snippets=("quiet",))
++    validate_readable_insight_report(mk_md, required_content_snippets=("quiet",))
++    rd_html = drop / "rd" / rid / "report.html"
++    canon_html = root / rid / "delivery" / "report.html"
++    assert rd_html.read_bytes() == canon_html.read_bytes()
++    assert out.slack_notify_status == "skipped"
++
++
++def test_run_delivery_slack_webhook_configured_posts_blocks(
++    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    monkeypatch.setenv(
++        "PHARMA_RD_SLACK_WEBHOOK_URL",
++        "https://hooks.slack.com/services/T00/B00/XXXXXXXX",
++    )
++    get_settings.cache_clear()
++    try:
++        rid = "run-7-slack"
++        syn = SynthesisOutput(
++            schema_version=5,
++            run_id=rid,
++            signal_characterization="mixed",
++            scan_summary_lines=["s"],
++            ranked_opportunities=[
++                RankedOpportunityItem(
++                    rank=1,
++                    title="First",
++                    rationale_short="Rationale text for Slack.",
++                    domain_coverage=DomainCoverage(
++                        clinical=True,
++                        competitor=False,
++                        consumer=True,
++                    ),
++                    commercial_viability="Viability note.",
++                )
++            ],
++        )
++        root = tmp_path / "art"
++        root.mkdir()
++        mock_resp = MagicMock(spec=httpx.Response)
++        mock_resp.status_code = 200
++        mock_client = MagicMock()
++        mock_client.post.return_value = mock_resp
++        mock_cm = MagicMock()
++        mock_cm.__enter__.return_value = mock_client
++        mock_cm.__exit__.return_value = None
++        with patch(
++            "pharma_rd.integrations.slack_insight_notification.httpx.Client",
++            return_value=mock_cm,
++        ):
++            out = run_delivery(rid, syn, root)
++        assert out.slack_notify_status == "ok"
++        assert "200" in out.slack_notify_detail
++        args, kwargs = mock_client.post.call_args
++        body = kwargs["json"]
++        assert "blocks" in body
++        joined = str(body["blocks"]) + body.get("text", "")
++        assert "pharma_RD" in joined
++        assert "recommendations" in joined.lower()
++        assert "First" in joined
++    finally:
++        get_settings.cache_clear()
++
++
++def test_run_delivery_run_id_mismatch() -> None:
++    with pytest.raises(ValueError, match="run_id mismatch"):
++        run_delivery(
++            "a",
++            SynthesisOutput(run_id="b"),
++            Path("."),
++        )
++
++
++def _gpt_json_ok() -> str:
++    return json.dumps(
++        {
++            "report_html": (
++                "<section><h1>Insight report</h1>"
++                "<p>Human judgment (FR22): Items in this report are recommendations "
++                "for review only—not approvals. Pursuit and portfolio decisions "
++                "remain human-owned.</p>"
++                "<p>Recommendation only—not an approval. "
++                "Pursuit is a human decision.</p>"
++                "<p>Commercial conclusion: validate externally.</p></section>"
++            ),
++            "report_markdown": (
++                "# Insight\n\n"
++                "Human judgment (FR22): Items in this report are recommendations "
++                "for review only—not approvals.\n\n"
++                "Recommendation only—not an approval.\n"
++            ),
++            "slack_executive_excerpt": "Strategic week: review ranked opportunities.",
++        }
++    )
++
++
++def test_run_delivery_gpt_renderer_mocked_openai(
++    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    monkeypatch.setenv("PHARMA_RD_REPORT_RENDERER", "gpt")
++    monkeypatch.setenv("PHARMA_RD_OPENAI_API_KEY", "sk-test")
++    get_settings.cache_clear()
++    try:
++        rid = "run-gpt"
++        syn = SynthesisOutput(
++            schema_version=5,
++            run_id=rid,
++            signal_characterization="net_new",
++            scan_summary_lines=["Clinical: pubs=1"],
++            ranked_opportunities=[],
++        )
++        root = tmp_path / "art"
++        root.mkdir()
++        with patch(
++            "pharma_rd.integrations.openai_report_delivery.run_chat_json_completion",
++            return_value=(_gpt_json_ok(), None),
++        ):
++            run_delivery(rid, syn, root)
++        md = (root / rid / "delivery" / "report.md").read_text(encoding="utf-8")
++        html = (root / rid / "delivery" / "report.html").read_text(encoding="utf-8")
++        assert "Human judgment (FR22)" in md
++        assert "<!DOCTYPE html>" in html
++        assert "Human judgment (FR22)" in html
++        assert "<script>" not in html.lower()
++    finally:
++        get_settings.cache_clear()
++
++
++def test_run_delivery_gpt_fallback_to_template_on_api_error(
++    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
++) -> None:
++    caplog.set_level(logging.WARNING)
++    monkeypatch.setenv("PHARMA_RD_REPORT_RENDERER", "gpt")
++    monkeypatch.setenv("PHARMA_RD_OPENAI_API_KEY", "sk-test")
++    get_settings.cache_clear()
++    try:
++        rid = "run-fb"
++        syn = SynthesisOutput(
++            schema_version=5,
++            run_id=rid,
++            signal_characterization="quiet",
++            scan_summary_lines=[],
++            ranked_opportunities=[],
++        )
++        root = tmp_path / "art"
++        root.mkdir()
++        with patch(
++            "pharma_rd.integrations.openai_report_delivery.run_chat_json_completion",
++            return_value=(None, "RateLimitError: 429"),
++        ):
++            run_delivery(rid, syn, root)
++        md = (root / rid / "delivery" / "report.md").read_text(encoding="utf-8")
++        assert "Human judgment (FR22)" in md
++        assert "Insight report" in md
++        assert any(
++            getattr(r, "event", None) == "delivery_gpt_fallback" for r in caplog.records
++        )
++    finally:
++        get_settings.cache_clear()
++
++
++def test_run_delivery_gpt_failure_without_fallback_raises(
++    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    monkeypatch.setenv("PHARMA_RD_REPORT_RENDERER", "gpt")
++    monkeypatch.setenv("PHARMA_RD_OPENAI_API_KEY", "sk-test")
++    monkeypatch.setenv("PHARMA_RD_REPORT_GPT_FALLBACK_ON_ERROR", "false")
++    get_settings.cache_clear()
++    try:
++        rid = "run-err"
++        syn = SynthesisOutput(
++            schema_version=5,
++            run_id=rid,
++            signal_characterization="quiet",
++            ranked_opportunities=[],
++        )
++        root = tmp_path / "art"
++        root.mkdir()
++        with patch(
++            "pharma_rd.integrations.openai_report_delivery.run_chat_json_completion",
++            return_value=(None, "APIStatusError"),
++        ):
++            with pytest.raises(ValueError, match="GPT report delivery failed"):
++                run_delivery(rid, syn, root)
++    finally:
++        get_settings.cache_clear()
+diff --git a/pharma_rd/tests/integrations/test_report_html_sanitize.py b/pharma_rd/tests/integrations/test_report_html_sanitize.py
+new file mode 100644
+index 0000000..b0cd62b
+--- /dev/null
++++ b/pharma_rd/tests/integrations/test_report_html_sanitize.py
+@@ -0,0 +1,13 @@
++"""report_html_sanitize (story 7.6)."""
++
++from __future__ import annotations
++
++from pharma_rd.integrations.report_html_sanitize import sanitize_report_html_fragment
++
++
++def test_sanitize_strips_script_tags() -> None:
++    raw = '<p>Safe</p><script>alert("xss")</script><p>After</p>'
++    out = sanitize_report_html_fragment(raw)
++    assert "<script>" not in out.lower()
++    assert "Safe" in out
++    assert "After" in out
+diff --git a/pharma_rd/README.md b/pharma_rd/README.md
+index 36b51c7..3a7b4bb 100644
+--- a/pharma_rd/README.md
++++ b/pharma_rd/README.md
+@@ -107,13 +107,33 @@ uv run pytest
+ - **Schedule (Epic 2):** `PHARMA_RD_SCHEDULE_CRON` (default **`0 0 * * sun`**, weekly Sunday) and `PHARMA_RD_SCHEDULER_TIMEZONE` (default **`UTC`**). Implementation: `pharma_rd/scheduler.py` (APScheduler). See **Recurring schedule** above.
+ - **Outbound HTTP (Epic 2 / story 2.2):** Shared **`httpx`** settings for connector calls: `PHARMA_RD_HTTP_TIMEOUT_SECONDS` (default **30**), `PHARMA_RD_HTTP_MAX_RETRIES` (default **3** extra attempts after the first request), `PHARMA_RD_HTTP_RETRY_BACKOFF_SECONDS` (default **0.5**, exponential backoff). Optional **`PHARMA_RD_CONNECTOR_PROBE_URL`**: when set, each pipeline stage performs a **GET** through this client before stub agent logic (leave unset for offline/tests). On failure, structured logs may include **`integration_error_class`** (e.g. `timeout`, `transient_exhausted`); stage **`error_summary`** in the DB includes the classification for operators.
+ - **Clinical agent (Epic 3 / FR6):** **`PHARMA_RD_THERAPEUTIC_AREAS`** — comma-separated **therapeutic area** labels used to build a PubMed query: **OR** across **Title/Abstract** terms, **AND** **`Clinical Trial[Publication Type]`** (trial publications only). When **empty** (default), the clinical stage **still completes** with explicit **`data_gaps`** in the JSON artifact (NFR-I1) and does not call NCBI. When set, the agent calls **NCBI E-utilities** (`esearch` → `efetch`) via the shared HTTP client; see **`pharma_rd/integrations/pubmed.py`**. Optional: **`PHARMA_RD_PUBMED_MAX_RESULTS`** (default **5**), **`PHARMA_RD_PUBMED_TOOL_EMAIL`** (recommended for responsible NCBI use), **`PHARMA_RD_PUBMED_EUTILS_BASE`** (override only for tests). **Practice/offline:** leave **`PHARMA_RD_THERAPEUTIC_AREAS`** unset to avoid outbound traffic; integration tests mock HTTP.
++- **GPT clinical analysis (Epic 3 / story 3.3):** **`PHARMA_RD_OPENAI_API_KEY`** — **optional**. **Where to set it:** add to **`.env`** in this directory (`pharma_rd/`, copied from **`.env.example`**) or **export** in your shell before **`uv run pharma-rd run`** / **`pharma-rd scheduler`**; **`Settings`** loads `.env` like other **`PHARMA_RD_*`** variables. **When you need it:** only if you want the **OpenAI** pass after publication fetch and internal-research merge; if unset or whitespace-only, the stage **skips** the call and adds an explicit note to **`integration_notes`** (stage still **completes**). **`PHARMA_RD_OPENAI_MODEL`** (default **`gpt-4o`**) and **`PHARMA_RD_OPENAI_TIMEOUT_SECONDS`** (default **120**) tune the request. **`PHARMA_RD_INSIGHT_ORG_DISPLAY_NAME`** (default **`iNova`**) appears in analyst-style system prompts for white-labeling. **Failure policy:** auth, rate limits, or timeouts **do not** fail the clinical stage—the artifact records **`integration_notes`** / **`data_gaps`** (NFR-R1, NFR-I2). **CI / tests:** no key required; **`call_clinical_gpt_analysis`** is mocked. **Never** commit real keys (NFR-S1).
++- **Therapeutic area validation (Epic 8 / FR23):** At **`Settings`** load, **`PHARMA_RD_THERAPEUTIC_AREAS`** is normalized (trimmed labels, stored with comma–space separators) and validated: **at most 32** labels, **at most 128** characters per label, **Unicode letters, digits, spaces, hyphen, underscore** only; **no** empty segments between commas. **Empty** (unset or whitespace-only) means **no TA scope** (NFR-I1). Invalid values raise at load time; **`pharma-rd`** exits **non-zero** and prints a validation error on **stderr**. Use **`Settings.therapeutic_area_labels()`** for the parsed list (do not split the raw string elsewhere).
++- **Competitor watchlist validation (Epic 8 / FR24):** At **`Settings`** load, **`PHARMA_RD_COMPETITOR_WATCHLIST`** is normalized and validated like TA scope: **at most 32** labels, **at most 128** characters per label, **Unicode letters, digits, spaces, hyphen, underscore**, plus **`&`**, **`.`**, **`(`** **`)`** for corporate-style names; **no** empty segments between commas. **Empty** means **no watchlist** (NFR-I1; Competitor stage uses explicit **`data_gaps`**). Invalid values fail at load; **`pharma-rd`** exits **non-zero** on **stderr**. Use **`Settings.competitor_labels()`** for the parsed list.
++- **Connection settings (Epic 8 / FR25):** Shared connector **timeouts / retries / backoff** are **`PHARMA_RD_HTTP_*`** (see **Outbound HTTP** above). **Base URLs** **`PHARMA_RD_PUBMED_EUTILS_BASE`**, **`PHARMA_RD_OPENFDA_DRUGSFDA_URL`**, optional **`PHARMA_RD_CONNECTOR_PROBE_URL`**, and optional **`PHARMA_RD_SLACK_WEBHOOK_URL`** must be valid **http(s)** URLs with a **host** at **`Settings`** load; **Slack** webhooks must use **`https://`**. Invalid URLs fail at load; **`pharma-rd`** exits **non-zero** on **stderr**. **`http_client.request_with_retries`** does not log bodies or secrets (NFR-S1).
++- **Practice mode deployment (Epic 8 / FR26):** **`PHARMA_RD_DEPLOYMENT_PROFILE`** — **`practice`** (default), **`staging`**, or **`production`**. **Practice** is the demo-oriented build: **public/mock sources** are allowed and **enterprise SSO is not required** for MVP (**FR34** is roadmap). Structured JSON logs include **`deployment_profile`** on pipeline start (`run_started` / `pipeline_resume`). Insight **`report.md`** / **`report.html`** add a **Run summary** line for **`practice`** only. **`PHARMA_RD_PRACTICE_CONSUMER_MOCK`** still controls the consumer fixture default when **`PHARMA_RD_CONSUMER_FEEDBACK_PATH`** is unset.
++- **Coarse access control (Epic 8 / FR32, NFR-S2):** Optional **`PHARMA_RD_ARTIFACT_ACCESS_TOKEN`** (max **8192** chars at load). When **set**, **`pharma-rd run`**, **`runs`**, **`status`**, and **`retry-stage`** require **`PHARMA_RD_CLI_ACCESS_TOKEN`** in the process environment to **match** (constant-time compare). **Unset** = no CLI guard (default for local dev). **Not** enforced for the in-process **`scheduler`** job (scheduled runs use **`enforce_cli_access=False`**). **Shared storage:** restrict **Unix permissions** on **`PHARMA_RD_DB_PATH`**, **`PHARMA_RD_ARTIFACTS_ROOT`**, and log destinations; **never** commit real tokens to git (NFR-S1). **`pharma-rd scheduler`** and **`--version` / help** do **not** require the CLI token.
+ - **Internal research (Epic 3 / FR7):** **`PHARMA_RD_INTERNAL_RESEARCH_PATH`** — optional path to a **single `.json` file** or a **directory** of **`*.json`** files. Each JSON file is either **one object** or an **array of objects** with required **`title`** and **`summary`** strings; optional **`reference`** and **`source_label`**. Relative paths resolve from the process **current working directory**. When **unset**, the clinical artifact includes an explicit **“not configured”** note (NFR-I1). **`PHARMA_RD_INTERNAL_RESEARCH_MAX_FILE_BYTES`** (default **262144**) caps per-file read size. Sample fixture: **`tests/fixtures/internal_research/sample.json`** (use its path in `.env` for practice demos).
+ - **Internal research path (MVP security note):** Paths are expanded (`~`) and resolved to absolute form; **symlinks are followed** like normal OS file access. The loader does **not** sandbox reads or enforce a “root” directory—point **`PHARMA_RD_INTERNAL_RESEARCH_PATH`** only at **trusted** locations. Stricter validation (e.g. rejecting symlinks) is a possible future hardening step.
+-- **Clinical stage artifact schema:** **`ClinicalOutput`** is **`schema_version` 2** (Epic 3): `run_id`, publication lists, internal research items, `data_gaps`, `integration_notes`, etc. Legacy **`schema_version` 1** artifacts were a minimal stub (`note` only). Stored **v1** JSON files are **not** interchangeable with **v2** validation—re-run pipelines or migrate old files if you relied on the v1 shape.
++- **Clinical stage artifact schema:** **`ClinicalOutput`** is **`schema_version` 3** (Epic 3 + story 3.3): `run_id`, **`therapeutic_areas_configured`**, publication lists, internal research items, optional **`clinical_gpt_analysis`** (analyst summary, TA relevance, priority trials), `data_gaps`, `integration_notes`. Legacy **`schema_version` 2** lacked **`clinical_gpt_analysis`** and **`therapeutic_areas_configured`** (use empty list / null when loading old files if you migrate manually). **`schema_version` 1** was a minimal stub (`note` only). Re-run pipelines for canonical **`schema_version` 3** output.
+ - **Competitor agent (Epic 4 / FR8–FR10):** **`PHARMA_RD_COMPETITOR_WATCHLIST`** — comma-separated **competitor labels** (MVP slice of FR24). When **empty** (default), the competitor stage **still completes** with explicit **`data_gaps`** for FR8 unless **FR9** scopes alone are configured (see below). **`PHARMA_RD_COMPETITOR_OBSERVATION_DAYS`** (default **30**) is described in **`integration_notes`** as a **calendar-day** observation window (UTC). **MVP:** that window is **narrative context for operators**—rows are **not** filtered against **`observed_at`** vs “now minus *N* days”; date-window filtering may arrive in a later story. **`PHARMA_RD_PIPELINE_DISCLOSURE_SCOPES`** — comma-separated **watch scope** labels for **FR9 pipeline disclosures**. When **empty**, **`integration_notes`** state that FR9 scopes are not configured. Rows are loaded from the same regulatory JSON fixture when **`PHARMA_RD_COMPETITOR_REGULATORY_PATH`** is set: top-level **`pipeline_disclosures`** array; each object has **`title`**, **`summary`**, **`reference`**, optional **`source_label`**, **`observed_at`**, and **`scope_tags`** (array of strings). Items are included in **`pipeline_disclosure_items`** when any **`scope_tags`** entry matches a configured scope (case-insensitive). **`PHARMA_RD_COMPETITOR_REGULATORY_PATH`** — optional JSON file or directory of **`*.json`** with top-level **`approvals`**, **`disclosures`**, **`pipeline_disclosures`**, and **`patent_filing_flags`** arrays. When the path is **set**, fixture data is used (practice demos). When **unset** but the watchlist is **non-empty**, the agent queries **OpenFDA `drugsfda`** for approvals; **FR9** pipeline and **FR10** patent rows require fixture JSON in MVP—**`integration_notes`** explain when no path is set. **`PHARMA_RD_OPENFDA_MAX_RESULTS`** (default **5**); **`PHARMA_RD_COMPETITOR_REGULATORY_MAX_FILE_BYTES`** caps per-file reads. Sample: **`tests/fixtures/competitor_regulatory/sample.json`**.
+ - **Competitor patent flags (FR10):** **`patent_filing_flags`** rows match **`PHARMA_RD_COMPETITOR_WATCHLIST`** via **`competitor_tags`** (case-insensitive). **Omitted** or **empty** **`competitor_tags`** applies the row to the **first** configured watchlist label (MVP). **NFR-S3:** outbound calls use **HTTPS** where the client supports it (e.g. OpenFDA).
+ - **Competitor regulatory path (MVP security note):** Same pattern as internal research: paths expand (`~`), **symlinks are followed**, no sandbox—use **trusted** paths only.
+-- **Competitor stage artifact schema:** **`CompetitorOutput`** is **`schema_version` 4** (Epic 4): `run_id`, **`approval_items`**, **`disclosure_items`**, **`pipeline_disclosure_items`** (FR9), **`patent_filing_flags`** (FR10), `data_gaps`, `integration_notes`. Older JSON without **`patent_filing_flags`** validates with an empty list. Legacy **`schema_version` 1** was a stub (`note` only).
++- **GPT competitor analysis (Epic 4 / story 4.4):** Uses the **same** **`PHARMA_RD_OPENAI_API_KEY`**, **`PHARMA_RD_OPENAI_MODEL`**, **`PHARMA_RD_OPENAI_TIMEOUT_SECONDS`**, and **`PHARMA_RD_INSIGHT_ORG_DISPLAY_NAME`** as **GPT clinical analysis (story 3.3)**—see that bullet for where/when to set the key. After FR8–FR10 rows are merged, the stage optionally calls OpenAI for competitive intelligence; **missing key**, **empty row sets**, and **API failures** follow the **same degrade policy** as story 3.3 (**`integration_notes`** / **`data_gaps`**; stage completes). **`call_competitor_gpt_analysis`** is mocked in tests.
++- **GPT consumer insight analysis (Epic 5 / story 5.4):** Same **`PHARMA_RD_OPENAI_*`** as stories **3.3** and **4.4**. After FR11–FR13 signals are aggregated, the stage optionally calls OpenAI for market-analyst interpretation; **same degrade policy**. **`call_consumer_gpt_analysis`** is mocked in tests. **NFR-S4:** practice and mock fixtures are **non-PHI**; do not put real patient or identifiable consumer data in prompts unless your enterprise privacy design allows it—the system prompt flags **practice/mock** inputs to reduce overconfidence.
++- **Competitor stage artifact schema:** **`CompetitorOutput`** is **`schema_version` 5** (Epic 4 + story 4.4): `run_id`, **`approval_items`**, **`disclosure_items`**, **`pipeline_disclosure_items`** (FR9), **`patent_filing_flags`** (FR10), optional **`competitor_gpt_analysis`** (strategic commentary, threat/opportunity themes, urgent attention flag/items/severity for downstream synthesis), `data_gaps`, `integration_notes`. Legacy **`schema_version` 4** lacked **`competitor_gpt_analysis`**. Older JSON without **`patent_filing_flags`** validates with an empty list. Legacy **`schema_version` 1** was a stub (`note` only).
++- **Consumer agent (Epic 5 / FR11):** **`PHARMA_RD_CONSUMER_FEEDBACK_PATH`** — optional path to a **single `.json` file** or a **directory** of **`*.json`** files. Each file is a JSON object with a **`feedback_themes`** array; each element has **`theme`**, **`summary`**, and **`source`** (reference or label). When **unset**, the stage uses a **practice mock** by default (**`PHARMA_RD_PRACTICE_CONSUMER_MOCK`**, default **`true`**) and records that fact in **`integration_notes`** (FR26). Set **`PHARMA_RD_PRACTICE_CONSUMER_MOCK=false`** with **no** feedback path to complete with **`data_gaps`** only (NFR-I1). **`PHARMA_RD_CONSUMER_FEEDBACK_MAX_FILE_BYTES`** caps per-file reads. Sample: **`tests/fixtures/consumer_feedback/sample.json`**.
++- **Pharmacy sales (Epic 5 / FR12):** **`PHARMA_RD_PHARMACY_SALES_PATH`** — optional JSON file or directory of **`*.json`** with top-level **`pharmacy_sales_trends`** array; each object has **`summary`**, **`scope`** (required), optional **`period`**, and **`source`**. When **unset**, **`integration_notes`** state that no sales feed is configured (NFR-I1). When the path is set but the file is missing or invalid, **`data_gaps`** explain the issue; **empty arrays** are described transparently. **`PHARMA_RD_PHARMACY_SALES_MAX_FILE_BYTES`** caps per-file reads. Sample: **`tests/fixtures/pharmacy_sales/sample.json`**.
++- **Unmet need / demand (Epic 5 / FR13):** **`PHARMA_RD_UNMET_NEED_DEMAND_PATH`** — optional JSON file or directory of **`*.json`** with top-level **`unmet_need_demand_signals`** array; each object has **`signal`** (short label), **`summary`**, and **`source`**. When **unset**, **`integration_notes`** state that no market demand feed is configured (NFR-I1). When the path is set but the file is missing or invalid, **`data_gaps`** explain the issue; **empty arrays** are described transparently. **`PHARMA_RD_UNMET_NEED_DEMAND_MAX_FILE_BYTES`** caps per-file reads. Sample: **`tests/fixtures/unmet_need_demand/sample.json`**.
++- **Consumer feedback path (MVP security note):** Same pattern as internal research: paths expand (`~`), **symlinks are followed**, no sandbox—use **trusted** paths only.
++- **Consumer stage artifact schema:** **`ConsumerOutput`** is **`schema_version` 5** (Epic 5 + story 5.4): `run_id`, **`feedback_themes`**, **`pharmacy_sales_trends`**, **`unmet_need_demand_signals`**, **`practice_mode`**, optional **`consumer_gpt_analysis`** (unmet-need synthesis, demand pattern summary, line-extension relevance), `data_gaps`, `integration_notes`. Legacy **`schema_version` 4** lacked **`consumer_gpt_analysis`**. Older **`schema_version` 3** lacked **`unmet_need_demand_signals`**. **`schema_version` 1** was a stub (`note` only).
++- **Synthesis (Epic 6 / FR14–FR17, FR27–FR28):** The runner loads **`ClinicalOutput`**, **`CompetitorOutput`**, and **`ConsumerOutput`** from **`{artifacts_root}/{run_id}/{stage}/output.json`** for the same **`run_id`**. If any file is missing or invalid JSON for its model, the stage fails with an operator-oriented error (path and **`run_id`** in the message). **`SynthesisOutput`** **`schema_version` 5** keeps **`aggregated_upstream_gaps`**, upstream **`schema_version`** fields, **`ranking_criteria_version`**, **`ranked_opportunities`**, plus **`signal_characterization`** (**`quiet`** \| **`net_new`** \| **`mixed`**) and **`scan_summary_lines`** (FR28: high-level counts/scopes from upstream models only). Each ranked row includes **`evidence_references`** (FR16: **`domain`**, **`label`**, **`reference`** from upstream **`reference`** / **`source`** fields, with **`summary`** used when helpful; if still empty, **`reference`** falls back to the row’s title/theme text). **`reference`** is capped at **500** characters in JSON output. **`commercial_viability`** (FR17) is qualitative MVP text. When every upstream list is empty, **`ranked_opportunities`** is **`[]`**. Usable-row caps and **`[synthesis]`** truncation lines behave as for FR15; **`rationale_short`** is length-capped. **MVP:** index-aligned pairing of the *i*-th usable row per domain. Legacy **`schema_version` 4** JSON loads with **`signal_characterization`** **`unknown`** and empty **`scan_summary_lines`** until re-run. Legacy **`schema_version` 3** lacks FR16/FR17 fields; older artifacts may need re-run for full validation.
++- **GPT synthesis (Epic 6 / story 6.5):** **`PHARMA_RD_SYNTHESIS_MODE`** — **`gpt`** (default) or **`deterministic`**. With **`gpt`** and **`PHARMA_RD_OPENAI_API_KEY`** set, the synthesis stage calls **OpenAI** (same **`PHARMA_RD_OPENAI_MODEL`** as other GPT steps, default **`gpt-4o`**) using JSON mode; the user prompt includes serialized **`ClinicalOutput`**, **`CompetitorOutput`**, and **`ConsumerOutput`** (including optional **`clinical_gpt_analysis`**, **`competitor_gpt_analysis`**, **`consumer_gpt_analysis`** when present). **`ranking_criteria_version`** is **`gpt_strategy_v1`**. **`aggregated_upstream_gaps`** (including **`[synthesis]`** truncation notes) and **`scan_summary_lines`** are still assembled **deterministically** from upstream artifacts for transparency. **`PHARMA_RD_OPENAI_SYNTHESIS_TIMEOUT_SECONDS`** (default **180**) bounds the synthesis request (NFR-P1). **Failure policy:** invalid JSON or **`SynthesisOutput`** validation failure triggers **one** bounded retry with a repair prompt; then the stage **fails** with an operator-oriented error (**no** silent fallback to deterministic). With **`gpt`** and **no** API key, synthesis **fails** unless you set **`PHARMA_RD_SYNTHESIS_MODE=deterministic`**. **`deterministic`** uses the legacy cross-domain ranking path (**`cross_domain_v1`**) without LLM—use for **CI/offline** without a key. **`pytest`** defaults **`PHARMA_RD_SYNTHESIS_MODE=deterministic`** in **`tests/conftest.py`**. Large upstream lists are capped per domain (**40** items per list) before prompting; see **`pharma_rd/integrations/openai_synthesis.py`**.
++- **Delivery / insight report (Epic 7 / FR18–FR19, FR22):** The delivery stage reads **`SynthesisOutput`** in memory from the runner, writes a **Markdown** report to **`{artifacts_root}/{run_id}/delivery/report.md`** and a **static HTML** twin to **`{artifacts_root}/{run_id}/delivery/report.html`** (UTF-8, atomic writes). **After** **`report.html`** exists on disk, the stage optionally **POST**s a **Slack Block Kit** notification when **`PHARMA_RD_SLACK_WEBHOOK_URL`** is set (see **Slack notifications** below); then it runs **distribution** (next bullet). It persists **`DeliveryOutput`** **`schema_version` 3** as **`{artifacts_root}/{run_id}/delivery/output.json`** with **`report_relative_path`**, **`report_format`** (**`markdown`**), **`report_byte_size`**, **`report_html_relative_path`**, **`report_html_byte_size`**, **`distribution_channel`** / **`distribution_status`** / **`distribution_detail`** (FR19), plus **`slack_notify_status`** / **`slack_notify_detail`** when Slack is used or skipped. **FR22 (human judgment):** disclaimer language is embedded in the **run summary** (executive callout), **each ranked opportunity**, the **Governance and disclaimer** section, and an HTML **`<footer>`**; wording lives in **`pharma_rd/agents/delivery.py`** for a single edit point. The report body also includes FR27/FR28 fields in the summary and ranked opportunities (no re-ranking).
++- **GPT report narrative (Epic 7 / story 7.6):** **`PHARMA_RD_REPORT_RENDERER`** — **`template`** (default, CI) or **`gpt`**. With **`gpt`** and **`PHARMA_RD_OPENAI_API_KEY`**, delivery calls OpenAI once (JSON response with **`report_html`** body fragment + **`report_markdown`** + optional **`slack_executive_excerpt`**). HTML is sanitized with **`nh3`** before write (allowlist tags; **no** `<script>`). A trusted shell adds **`<!DOCTYPE>`**, charset, base CSS, and the FR26 practice banner when applicable. If the model omits required FR22 phrases, the stage **prepends** the executive FR22 banner. **`PHARMA_RD_OPENAI_REPORT_DELIVERY_TIMEOUT_SECONDS`** (default **150**) bounds the call (NFR-P1). **`PHARMA_RD_REPORT_GPT_FALLBACK_ON_ERROR`** (default **true**): on API/parse failure, delivery **falls back** to the string-template renderer and logs **`delivery_gpt_fallback`** (NFR-R1). **`gpt`** without an API key logs **`delivery_gpt_skipped_no_key`** and uses the template. Slack uses **`slack_executive_excerpt`** for the executive block when present (truncated). Implementation: **`pharma_rd/integrations/openai_report_delivery.py`**, **`report_html_sanitize.py`**.
++- **Slack notifications (Epic 7 / FR19 extension):** **`PHARMA_RD_SLACK_WEBHOOK_URL`** — optional **incoming webhook** URL ([Slack incoming webhooks](https://api.slack.com/messaging/webhooks)). When **unset** or empty, **no** HTTP request is made; structured logs record **`slack_notify_skipped`** (INFO). When set, the pipeline sends **`blocks`** (Block Kit) plus a plain **`text`** fallback. The message includes **UTC run date** (calendar date at delivery execution), **pharma_RD** branding, **`signal_characterization`**, top ranked opportunities, therapeutic-area and competitor-watchlist scope from settings, an **FR22** disclaimer aligned with the report, and the **on-disk absolute path** to **`report.html`** (MVP). **`PHARMA_RD_SLACK_WEBHOOK_TIMEOUT_SECONDS`** defaults to **10** seconds (separate from connector HTTP). Webhook failures do **not** fail the delivery stage; logs use **`slack_notify_failed`** with actionable detail (**no** full URL or secrets). Implementation: **`pharma_rd/integrations/slack_insight_notification.py`**.
++- **Report distribution (Epic 7 / FR19):** **`PHARMA_RD_DISTRIBUTION_CHANNEL`** — **`none`** (default, explicit skip in logs), **`file_drop`**, or **`smtp`**. **File drop (MVP):** set **`PHARMA_RD_DISTRIBUTION_DROP_DIR`** to a directory root; after **`report.md`** and **`report.html`** are written, the pipeline copies them to **`{drop_dir}/rd/{run_id}/`** and **`{drop_dir}/marketing/{run_id}/`** and writes **`{drop_dir}/{run_id}/manifest.json`** with absolute paths for audit (including HTML paths when present). **`smtp`** is reserved: distribution logs **`distribution_failed`** with **`error_type=smtp_not_implemented`** and **`distribution_status=failed`** (no credentials logged). Placeholder recipient envs for future SMTP: **`PHARMA_RD_RD_RECIPIENT_EMAIL`**, **`PHARMA_RD_MARKETING_RECIPIENT_EMAIL`**. **Product choice (fail-fast):** distribution failures do **not** abort the delivery stage—the run still writes **`DeliveryOutput`** with **`distribution_status=failed`** and structured **`distribution_failed`** logs (NFR-R1).
++- **For recipients (Epic 7 / FR20–FR21, NFR-P2, FR22):** **R&D** and **marketing** receive the **same** files for each **`run_id`** (separate folders for role audit only). **Markdown:** open **`report.md`** in any text editor or Markdown-aware tool (e.g. **VS Code**, **Cursor**, GitHub/GitLab preview). **Browser (no extension):** double-click **`report.html`** or open it via **File → Open** in **Chrome**, **Edge**, or **Safari** (`file://` is fine for local copies). **Email:** attaching **`report.md`** yields readable plain text; **`report.html`** can be opened in a browser if the mail client saves attachments. No **pharma_RD**-specific desktop client is required. **FR22:** read the executive callout, per-opportunity lines, governance section, and HTML footer so **recommendations** are clearly **not approvals** and **pursuit remains human-owned**.
+ 
+ ## Layout note
+ 
+diff --git a/pharma_rd/.env.example b/pharma_rd/.env.example
+index 4615941..ada889c 100644
+--- a/pharma_rd/.env.example
++++ b/pharma_rd/.env.example
+@@ -1,5 +1,10 @@
+ # Copy to `.env` for local overrides. Never commit real secrets (NFR-S1).
+ PHARMA_RD_ENV=development
++# Epic 8 / FR26: practice (default), staging, or production — demo uses practice; no enterprise SSO for MVP (FR34 roadmap)
++PHARMA_RD_DEPLOYMENT_PROFILE=practice
++# Epic 8 / FR32 (NFR-S2): optional shared secret — when set, run/runs/status/retry-stage need PHARMA_RD_CLI_ACCESS_TOKEN to match (never commit real values; NFR-S1)
++# PHARMA_RD_ARTIFACT_ACCESS_TOKEN=
++# PHARMA_RD_CLI_ACCESS_TOKEN=   # export in shell for CLI; not loaded from .env by Settings
+ # SQLite path (default: data/app.db under cwd when using `uv run` from pharma_rd/)
+ PHARMA_RD_DB_PATH=data/app.db
+ # Run history retention in days (default 30 per NFR-R2 practice baseline)
+@@ -13,6 +18,7 @@ PHARMA_RD_SCHEDULE_CRON="0 0 * * sun"
+ # IANA timezone for cron interpretation (default UTC)
+ PHARMA_RD_SCHEDULER_TIMEZONE=UTC
+ # Outbound HTTP: timeouts and bounded retries for connector calls (story 2.2)
++# Epic 8 / FR25: PHARMA_RD_CONNECTOR_PROBE_URL must be http(s) with a host when set
+ # PHARMA_RD_HTTP_TIMEOUT_SECONDS=30
+ # PHARMA_RD_HTTP_MAX_RETRIES=3
+ # PHARMA_RD_HTTP_RETRY_BACKOFF_SECONDS=0.5
+@@ -20,16 +26,36 @@ PHARMA_RD_SCHEDULER_TIMEZONE=UTC
+ # PHARMA_RD_CONNECTOR_PROBE_URL=
+ 
+ # Clinical agent (Epic 3 / FR6): comma-separated TA labels for PubMed Title/Abstract search
++# Epic 8 / FR23: validated at load (max 32 labels, max 128 chars each; letters/digits/spaces/_/-; no empty between commas); empty = no TA scope
+ # PHARMA_RD_THERAPEUTIC_AREAS=oncology,diabetes
+ # PHARMA_RD_PUBMED_MAX_RESULTS=5
+ # PHARMA_RD_PUBMED_TOOL_EMAIL=ops@example.com
++# Epic 8 / FR25: PHARMA_RD_PUBMED_EUTILS_BASE must be http(s) with a host
+ # PHARMA_RD_PUBMED_EUTILS_BASE=https://eutils.ncbi.nlm.nih.gov/entrez/eutils
+ 
+ # Internal research JSON (Epic 3 / FR7): one file or a directory of *.json
+ # PHARMA_RD_INTERNAL_RESEARCH_PATH=tests/fixtures/internal_research/sample.json
+ # PHARMA_RD_INTERNAL_RESEARCH_MAX_FILE_BYTES=262144
+ 
++# GPT clinical analysis (Epic 3 / story 3.3): optional OpenAI Chat Completions after PubMed + internal research merge
++# Set PHARMA_RD_OPENAI_API_KEY in .env (pharma_rd/) or export in the shell — never commit real keys (NFR-S1)
++# Unset or empty = skip GPT step; integration_notes record the skip; stage still completes (NFR-I1)
++# PHARMA_RD_OPENAI_API_KEY=
++# PHARMA_RD_OPENAI_MODEL=gpt-4o
++# PHARMA_RD_OPENAI_TIMEOUT_SECONDS=120
++# PHARMA_RD_INSIGHT_ORG_DISPLAY_NAME=iNova
++# GPT competitor analysis (Epic 4 / story 4.4): same variables as above; runs after regulatory rows are loaded
++# GPT consumer insight analysis (Epic 5 / story 5.4): same PHARMA_RD_OPENAI_* as 3.3/4.4; runs after FR11–FR13 signals are aggregated
++# GPT synthesis (Epic 6 / story 6.5): gpt = OpenAI JSON synthesis when PHARMA_RD_OPENAI_API_KEY is set; deterministic = legacy ranking without LLM (offline/CI)
++# PHARMA_RD_SYNTHESIS_MODE=gpt
++# PHARMA_RD_OPENAI_SYNTHESIS_TIMEOUT_SECONDS=180
++# GPT report delivery (Epic 7 / story 7.6): template = string renderer (default); gpt = OpenAI narrative HTML+Markdown
++# PHARMA_RD_REPORT_RENDERER=template
++# PHARMA_RD_OPENAI_REPORT_DELIVERY_TIMEOUT_SECONDS=150
++# PHARMA_RD_REPORT_GPT_FALLBACK_ON_ERROR=true
++
+ # Competitor agent (Epic 4 / FR8): comma-separated competitor labels; observation window (calendar days)
++# Epic 8 / FR24: validated at load (max 32 labels, max 128 chars each; same as TA plus & . ( ); no empty between commas); empty = gaps path
+ # PHARMA_RD_COMPETITOR_WATCHLIST=AcmePharma,BetaBio
+ # PHARMA_RD_COMPETITOR_OBSERVATION_DAYS=30
+ # Pipeline disclosure watch scopes (Epic 4 / FR9): comma-separated labels; match fixture scope_tags
+@@ -37,5 +63,30 @@ PHARMA_RD_SCHEDULER_TIMEZONE=UTC
+ # Optional: JSON fixture path (approvals, disclosures, pipeline_disclosures, patent_filing_flags); unset = OpenFDA when watchlist set
+ # PHARMA_RD_COMPETITOR_REGULATORY_PATH=tests/fixtures/competitor_regulatory/sample.json
+ # PHARMA_RD_COMPETITOR_REGULATORY_MAX_FILE_BYTES=262144
++# Epic 8 / FR25: PHARMA_RD_OPENFDA_DRUGSFDA_URL must be http(s) with a host
+ # PHARMA_RD_OPENFDA_DRUGSFDA_URL=https://api.fda.gov/drug/drugsfda.json
+ # PHARMA_RD_OPENFDA_MAX_RESULTS=5
++
++# Consumer agent (Epic 5 / FR11): optional JSON fixture; practice mock when unset
++# PHARMA_RD_CONSUMER_FEEDBACK_PATH=tests/fixtures/consumer_feedback/sample.json
++# PHARMA_RD_CONSUMER_FEEDBACK_MAX_FILE_BYTES=262144
++# PHARMA_RD_PRACTICE_CONSUMER_MOCK=true
++
++# Pharmacy sales trends (Epic 5 / FR12): optional JSON fixture
++# PHARMA_RD_PHARMACY_SALES_PATH=tests/fixtures/pharmacy_sales/sample.json
++# PHARMA_RD_PHARMACY_SALES_MAX_FILE_BYTES=262144
++
++# Unmet need / demand signals (Epic 5 / FR13): optional JSON fixture
++# PHARMA_RD_UNMET_NEED_DEMAND_PATH=tests/fixtures/unmet_need_demand/sample.json
++# PHARMA_RD_UNMET_NEED_DEMAND_MAX_FILE_BYTES=262144
++
++# Report distribution (Epic 7 / FR19): none | file_drop | smtp (smtp not implemented in MVP)
++# PHARMA_RD_DISTRIBUTION_CHANNEL=none
++# PHARMA_RD_DISTRIBUTION_DROP_DIR=/var/pharma_rd/drops
++# PHARMA_RD_RD_RECIPIENT_EMAIL=rd@example.com
++# PHARMA_RD_MARKETING_RECIPIENT_EMAIL=marketing@example.com
++
++# Slack incoming webhook (Epic 7 / FR19): optional Block Kit ping after report.html exists
++# Epic 8 / FR25: PHARMA_RD_SLACK_WEBHOOK_URL must be https:// when set (NFR-S1)
++# PHARMA_RD_SLACK_WEBHOOK_URL=
++# PHARMA_RD_SLACK_WEBHOOK_TIMEOUT_SECONDS=10
+diff --git a/_bmad-output/implementation-artifacts/sprint-status.yaml b/_bmad-output/implementation-artifacts/sprint-status.yaml
+index ff11754..ecd66f7 100644
+--- a/_bmad-output/implementation-artifacts/sprint-status.yaml
++++ b/_bmad-output/implementation-artifacts/sprint-status.yaml
+@@ -1,5 +1,5 @@
+ # generated: '2026-04-04'
+-# last_updated: '2026-04-05T23:59:59Z'
++# last_updated: '2026-04-05T22:00:00Z'
+ # project: pharma_RD_workflow
+ # project_key: NOKEY
+ # tracking_system: file-system
+@@ -35,14 +35,14 @@
+ # - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
+ 
+ generated: '2026-04-04'
+-last_updated: '2026-04-05T23:59:59Z'
++last_updated: '2026-04-06T14:00:00Z'
+ project: pharma_RD_workflow
+ project_key: NOKEY
+ tracking_system: file-system
+ story_location: "{project-root}/_bmad-output/implementation-artifacts"
+ 
+ development_status:
+-  epic-1: in-progress
++  epic-1: done
+   1-1-initialize-project-from-architecture-baseline: done
+   1-2-persist-runs-and-stages-in-sqlite: done
+   1-3-pipeline-runner-with-ordered-stages-and-artifact-handoffs: done
+@@ -60,38 +60,44 @@ development_status:
+   epic-3: in-progress
+   3-1-discover-and-summarize-clinical-trial-publications-for-configured-tas: done
+   3-2-ingest-internal-research-summaries-including-stub-sample-path: done
++  3-3-gpt-powered-clinical-analysis: done
+   epic-3-retrospective: optional
+ 
+   epic-4: done
+   4-1-track-approvals-and-regulatory-disclosures: done
+   4-2-pipeline-disclosure-watch-scopes: done
+   4-3-patent-filing-flags: done
++  4-4-gpt-powered-competitor-analysis: done
+   epic-4-retrospective: optional
+ 
+-  epic-5: backlog
+-  5-1-consumer-feedback-signals: backlog
+-  5-2-pharmacy-sales-trend-signals-when-configured: backlog
+-  5-3-unmet-need-and-demand-signals: backlog
++  epic-5: done
++  5-1-consumer-feedback-signals: done
++  5-2-pharmacy-sales-trend-signals-when-configured: done
++  5-3-unmet-need-and-demand-signals: done
++  5-4-gpt-powered-consumer-insight-analysis: done
+   epic-5-retrospective: optional
+ 
+-  epic-6: backlog
+-  6-1-consume-monitoring-agent-outputs-for-a-run: backlog
+-  6-2-ranked-opportunities-with-cross-domain-cross-reference: backlog
+-  6-3-evidence-references-and-commercial-viability-per-item: backlog
+-  6-4-quiet-run-and-scan-summary-transparency-in-synthesis-output: backlog
++  epic-6: in-progress
++  6-1-consume-monitoring-agent-outputs-for-a-run: done
++  6-2-ranked-opportunities-with-cross-domain-cross-reference: done
++  6-3-evidence-references-and-commercial-viability-per-item: done
++  6-4-quiet-run-and-scan-summary-transparency-in-synthesis-output: done
++  6-5-gpt-powered-synthesis: done
+   epic-6-retrospective: optional
+ 
+-  epic-7: backlog
+-  7-1-render-structured-insight-report-artifact: backlog
+-  7-2-distribute-report-to-r-d-and-marketing-recipients: backlog
+-  7-3-recipients-open-and-read-the-report: backlog
+-  7-4-human-owned-pursuit-language-in-the-report: backlog
++  epic-7: in-progress
++  7-1-render-structured-insight-report-artifact: done
++  7-2-distribute-report-to-r-d-and-marketing-recipients: done
++  7-3-recipients-open-and-read-the-report: done
++  7-4-human-owned-pursuit-language-in-the-report: done
++  7-5-slack-webhook-delivery: done
++  7-6-gpt-powered-report-narrative-and-formatting: review
+   epic-7-retrospective: optional
+ 
+-  epic-8: backlog
+-  8-1-therapeutic-area-scope-configuration: backlog
+-  8-2-competitor-watchlists-and-identifiers: backlog
+-  8-3-connection-settings-for-permitted-external-sources: backlog
+-  8-4-practice-mode-without-enterprise-sso: backlog
+-  8-5-coarse-access-control-for-reports-and-logs: backlog
++  epic-8: done
++  8-1-therapeutic-area-scope-configuration: done
++  8-2-competitor-watchlists-and-identifiers: done
++  8-3-connection-settings-for-permitted-external-sources: done
++  8-4-practice-mode-without-enterprise-sso: done
++  8-5-coarse-access-control-for-reports-and-logs: done
+   epic-8-retrospective: optional
+diff --git a/_bmad-output/implementation-artifacts/7-6-gpt-powered-report-narrative-and-formatting.md b/_bmad-output/implementation-artifacts/7-6-gpt-powered-report-narrative-and-formatting.md
+new file mode 100644
+index 0000000..9d28298
+--- /dev/null
++++ b/_bmad-output/implementation-artifacts/7-6-gpt-powered-report-narrative-and-formatting.md
+@@ -0,0 +1,96 @@
++# Story 7.6: GPT-powered report narrative and formatting
++
++Status: review
++
++## Story
++
++As a **workflow operator**,
++I want **Delivery to generate the executive insight report via GPT-4o as narrative HTML**,
++So that **recipients receive a CEO-ready document**: prose executive summary, contextual narratives per opportunity, commercial conclusion, **FR22** disclaimer, and **high-quality readable styling** for browser and Slack surfaces (extends FR18, FR22; aligns with NFR-P2).
++
++## Acceptance Criteria
++
++1. **Given** **`SynthesisOutput`** exists for **`run_id`**  
++   **When** **`PHARMA_RD_OPENAI_API_KEY`** is **set**  
++   **Then** Delivery **calls OpenAI** (default **gpt-4o**, configurable) with a **system prompt** positioning the model as a **senior pharmaceutical strategy consultant**  
++   **And** the **user** message includes **full synthesis payload** (and key **settings** context: TA scope, competitor watchlist **labels**—no secrets) sufficient to produce the report  
++
++2. **Given** a successful model response  
++   **When** artifacts are written  
++   **Then** **`report.html`** is **valid, self-contained HTML** (embedded or linked **CSS**) suitable for **direct browser open** and **Slack** unfurl-friendly preview where applicable  
++   **And** the document includes:  
++   - **Executive summary** as **continuous prose** (not bullet-only).  
++   - **Narrative context** for **each ranked opportunity** (not template stubs only).  
++   - **Commercially framed conclusion** section.  
++   - **FR22** disclaimer **prominently** (executive + per-opportunity and/or footer as required by compliance story **7.4**).  
++
++3. **Given** **`report.md`** is still required for distribution / audit  
++   **When** Delivery runs  
++   **Then** either **GPT also emits Markdown** in one call, **or** a **second** constrained call / deterministic MD-from-HTML—**document** approach; file-drop and **Slack** integrations (**7.2**, **7.5**) **continue to work**  
++
++4. **Given** OpenAI **failure**  
++   **When** Delivery runs  
++   **Then** **fail** with actionable error **or** **fallback** to pre-7.6 template renderer—**document**; no empty **`report.html`** without explanation (NFR-R1)  
++
++5. **Given** **security**  
++   **When** HTML is produced  
++   **Then** output is **safe for local `file://` viewing**: avoid **inline scripts** from model unless sanitized; if model returns untrusted HTML, **sanitize** (allowlist tags) before write (document library choice)  
++
++6. **Given** **tests**  
++   **When** CI runs  
++   **Then** OpenAI mocked; snapshot **key HTML sections**; **no API key** in repo  
++
++## Tasks / Subtasks
++
++- [x] Refactor **`delivery.py`**: GPT path generates **`report.html`** (and **`report.md`** per AC3); retire or flag **string-template** path as **`PHARMA_RD_REPORT_RENDERER=gpt|template`**.  
++- [x] Add **HTML sanitization** step if model returns raw HTML.  
++- [x] Tune **Slack** integration (**7.5**) to excerpt **GPT prose** within Block Kit limits or attach summary.  
++- [x] Tests: mocks, sanitization, FR22 string presence, fallback path.  
++- [x] **README**: CEO-ready positioning; token/latency expectations (NFR-P1).  
++
++## Dev Notes
++
++- **Depends on:** **6.5** for GPT-quality **`SynthesisOutput`**; may accept deterministic synthesis if flag allows.  
++- **Slack:** Block Kit **3000-char** limits may require **truncation** of GPT narrative with “open full HTML” link/path.  
++- **Brand:** “pharma_RD” / iNova naming—use **settings** or constants for white-label.  
++
++## References
++
++- FR18, FR19, FR20, FR21, FR22, NFR-P2, NFR-R1, NFR-S1  
++- `pharma_rd/pharma_rd/agents/delivery.py`, `pharma_rd/pharma_rd/integrations/slack_insight_notification.py`  
++
++## Dev Agent Record
++
++### Implementation Plan
++
++- **`PHARMA_RD_REPORT_RENDERER`**: `gpt` | `template` (default **template** for CI).
++- **`openai_report_delivery.py`**: one JSON completion (`report_html` fragment, `report_markdown`, optional `slack_executive_excerpt`).
++- **`report_html_sanitize.py`**: **`nh3.clean()`** on body fragment; trusted shell in **`delivery._wrap_gpt_html_fragment`**.
++- FR22 injection if model omits phrases; fallback to template when **`report_gpt_fallback_on_error`** (default true).
++- Slack: **`gpt_executive_excerpt`** replaces signal-only executive block when set.
++
++### Completion Notes
++
++- **187** tests passing; **`nh3`** dependency added.
++- **`tests/conftest.py`** defaults **`PHARMA_RD_REPORT_RENDERER=template`**.
++
++### File List
++
++- `pharma_rd/pharma_rd/agents/delivery.py`
++- `pharma_rd/pharma_rd/config.py`
++- `pharma_rd/pharma_rd/integrations/openai_client.py`
++- `pharma_rd/pharma_rd/integrations/openai_report_delivery.py`
++- `pharma_rd/pharma_rd/integrations/report_html_sanitize.py`
++- `pharma_rd/pharma_rd/integrations/slack_insight_notification.py`
++- `pharma_rd/pyproject.toml`
++- `pharma_rd/uv.lock`
++- `pharma_rd/tests/conftest.py`
++- `pharma_rd/tests/agents/test_delivery.py`
++- `pharma_rd/tests/integrations/test_report_html_sanitize.py`
++- `pharma_rd/README.md`
++- `pharma_rd/.env.example`
++- `_bmad-output/implementation-artifacts/sprint-status.yaml`
++
++### Change Log
++
++- 2026-04-06: Story 7.6 — GPT report renderer, nh3 sanitization, Slack excerpt, tests, README.

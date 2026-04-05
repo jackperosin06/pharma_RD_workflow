@@ -1,0 +1,9 @@
+# pharma_RD_workflow — AI agent instructions
+
+Before answering questions, planning work, or writing or editing code in this repository, **read the project context document** for stack, conventions, and non-negotiable rules:
+
+**`_bmad-output/project-context.md`**
+
+That file is the authoritative summary of technology versions, pipeline contracts, logging, testing, security, and product constraints (e.g. decision-support positioning, human-owned pursuit language). Follow it unless the user explicitly overrides for a one-off task.
+
+If the context file and the codebase disagree (e.g. after a refactor), prefer the **current code** and suggest updating `_bmad-output/project-context.md`.

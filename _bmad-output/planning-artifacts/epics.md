@@ -7,7 +7,7 @@ stepsCompleted:
 workflowType: epics-and-stories
 project_name: pharma_RD_workflow
 user_name: Jackperosin_
-date: '2026-04-04'
+date: '2026-04-06'
 status: complete
 inputDocuments:
   - _bmad-output/planning-artifacts/prd.md
@@ -121,6 +121,20 @@ _No UX design specification document was present under `planning-artifacts`. Rep
 | FR32 | Epic 8 | Coarse access control |
 | FR33–FR35 | — | **Out of MVP** (roadmap only) |
 
+### LLM enhancement stories (OpenAI GPT-4o)
+
+Post-baseline stories add **model-assisted analysis** on top of existing fetch/aggregate behavior. Full specs live under **`_bmad-output/implementation-artifacts/`**.
+
+| Story | Epic | Summary |
+|-------|------|---------|
+| **3.3** | Epic 3 | GPT clinical analyst after PubMed fetch → `ClinicalOutput` enrichment |
+| **4.4** | Epic 4 | GPT competitive intelligence after FDA/regulatory fetch → `CompetitorOutput` enrichment |
+| **5.4** | Epic 5 | GPT market analyst after consumer signals → `ConsumerOutput` enrichment |
+| **6.5** | Epic 6 | Replace deterministic synthesis with GPT strategy advisor; **must** validate to `SynthesisOutput` |
+| **7.6** | Epic 7 | GPT-generated CEO-ready HTML/Markdown report narrative; FR22 + sanitization |
+
+**Recommended order:** **3.3 → 4.4 → 5.4** (parallelizable after shared OpenAI client) → **6.5** → **7.6**.
+
 ## Epic List
 
 ### Epic 1: Executable pipeline foundation
@@ -147,7 +161,7 @@ Workflow operators can configure **recurring runs**, rely on **timeouts and boun
 
 The system produces **structured clinical monitoring output** for each run: **publication discovery/summary** for configured TAs and **internal research ingestion** when configured (including stubs).
 
-**FRs covered:** FR6, FR7
+**FRs covered:** FR6, FR7; **Story 3.3** extends interpretation via GPT (see LLM enhancement table).
 
 **NFRs addressed:** NFR-I1, NFR-I2, NFR-S3 (where applicable)
 
@@ -157,7 +171,7 @@ The system produces **structured clinical monitoring output** for each run: **pu
 
 The system tracks **approvals/disclosures**, **pipeline disclosures** within watch scopes, and **patent filing** signals for configured competitors.
 
-**FRs covered:** FR8, FR9, FR10
+**FRs covered:** FR8, FR9, FR10; **Story 4.4** extends interpretation via GPT (see LLM enhancement table).
 
 **NFRs addressed:** NFR-I1, NFR-I2, NFR-S3
 
@@ -167,7 +181,7 @@ The system tracks **approvals/disclosures**, **pipeline disclosures** within wat
 
 The system surfaces **consumer feedback**, optional **pharmacy sales trends**, and **unmet need / demand** signals from configured (including mock) sources.
 
-**FRs covered:** FR11, FR12, FR13
+**FRs covered:** FR11, FR12, FR13; **Story 5.4** extends interpretation via GPT (see LLM enhancement table).
 
 **NFRs addressed:** NFR-I1, NFR-I2, NFR-S3
 
@@ -177,7 +191,7 @@ The system surfaces **consumer feedback**, optional **pharmacy sales trends**, a
 
 The Synthesis step **consumes** the three monitoring agents’ outputs, **cross-references** domains into a **ranked opportunity list** with **evidence** and **commercial viability**, and embeds **quiet-run** and **scan summary** transparency.
 
-**FRs covered:** FR14, FR15, FR16, FR17, FR27, FR28
+**FRs covered:** FR14, FR15, FR16, FR17, FR27, FR28; **Story 6.5** replaces deterministic core with GPT strategy synthesis while keeping **`SynthesisOutput`** contract (see LLM enhancement table).
 
 **NFRs addressed:** NFR-I1 (graceful partial inputs)
 
@@ -185,9 +199,9 @@ The Synthesis step **consumes** the three monitoring agents’ outputs, **cross-
 
 ### Epic 7: Delivery and consumption
 
-The Delivery step **renders** the structured insight report, **distributes** it to R&D and marketing recipients, ensures **readability** without specialized clients, and **frames recommendations as human-owned** decisions.
+The Delivery step **renders** the structured insight report, **distributes** it to R&D and marketing recipients (e.g. file drop, optional **Slack incoming webhook** notification), ensures **readability** without specialized clients, and **frames recommendations as human-owned** decisions.
 
-**FRs covered:** FR18, FR19, FR20, FR21, FR22 (FR31 completion for demo narrative)
+**FRs covered:** FR18, FR19, FR20, FR21, FR22 (FR31 completion for demo narrative); **Story 7.6** adds GPT-authored HTML/Markdown narrative (see LLM enhancement table).
 
 **NFRs addressed:** NFR-P2, NFR-S2 (with Epic 8)
 
@@ -395,6 +409,22 @@ So that **practice mode can use sample data** without live internal systems (FR7
 
 ---
 
+### Story 3.3: GPT-powered clinical analysis
+
+As a **workflow operator**,
+I want **PubMed/publication fetch results passed to GPT-4o as a pharma R&D analyst**,
+So that **significance, TA relevance, and trial prioritization for iNova** are interpreted, not only listed (extends FR6).
+
+**Specification:** `_bmad-output/implementation-artifacts/3-3-gpt-powered-clinical-analysis.md`
+
+**Acceptance Criteria (summary):**
+
+**Given** fetch completes and **`PHARMA_RD_OPENAI_API_KEY`** is set  
+**When** the Clinical stage runs  
+**Then** OpenAI (**gpt-4o**, configurable) receives system + user prompts with **TA scope** and publication payload; **`ClinicalOutput`** gains validated analyst fields; tests **mock** the API (NFR-S1).
+
+---
+
 ## Epic 4: Competitor Intelligence Agent
 
 **Goal:** Deliver **competitor approvals/disclosures**, **pipeline disclosures**, and **patent filing** signals per watchlists.
@@ -441,6 +471,22 @@ So that **IP pressure is visible early** (FR10).
 **When** the Competitor stage runs
 **Then** output includes **patent-related flags** with references or **explicit empty** state
 **And** TLS used for external APIs where supported (NFR-S3)
+
+---
+
+### Story 4.4: GPT-powered competitor analysis
+
+As a **workflow operator**,
+I want **FDA/regulatory fetch results passed to GPT-4o as a pharmaceutical competitive intelligence analyst**,
+So that **strategic significance, threats, opportunities, and urgent items** are interpreted (extends FR8–FR10).
+
+**Specification:** `_bmad-output/implementation-artifacts/4-4-gpt-powered-competitor-analysis.md`
+
+**Acceptance Criteria (summary):**
+
+**Given** competitor stage data is assembled and the API key is set  
+**When** the Competitor stage runs  
+**Then** GPT-4o enriches **`CompetitorOutput`**; degradation policy **aligned** with Story 3.3; tests use mocks.
 
 ---
 
@@ -491,6 +537,22 @@ So that **synthesis can rank opportunities with demand context** (FR13).
 **When** the Consumer stage runs
 **Then** output includes **demand/unmet need** signals or explicit **insufficient signal** wording
 **And** outputs remain **non-PHI** by default (NFR-S4)
+
+---
+
+### Story 5.4: GPT-powered consumer insight analysis
+
+As a **workflow operator**,
+I want **aggregated consumer signals passed to GPT-4o as a pharmaceutical market analyst**,
+So that **unmet needs, demand patterns, and line-extension relevance** are interpreted (extends FR11–FR13).
+
+**Specification:** `_bmad-output/implementation-artifacts/5-4-gpt-powered-consumer-insight-analysis.md`
+
+**Acceptance Criteria (summary):**
+
+**Given** consumer stage payload is assembled and the API key is set  
+**When** the Consumer stage runs  
+**Then** **`ConsumerOutput`** is enriched; degradation **aligned** with Stories 3.3 / 4.4; mocks in CI.
 
 ---
 
@@ -558,9 +620,25 @@ So that **I trust the report when little changed** (FR27, FR28).
 
 ---
 
+### Story 6.5: GPT-powered synthesis
+
+As a **workflow operator**,
+I want **Synthesis to use GPT-4o as a pharmaceutical strategy advisor across all three monitoring outputs**,
+So that **ranking, rationale, cross-domain reasoning, and urgency** replace deterministic logic while **`SynthesisOutput`** remains **Pydantic-valid** (FR14–FR17, FR27–FR28).
+
+**Specification:** `_bmad-output/implementation-artifacts/6-5-gpt-powered-synthesis.md`
+
+**Acceptance Criteria (summary):**
+
+**Given** upstream outputs (including GPT fields from 3.3–5.4 when present)  
+**When** the API key is set  
+**Then** **deterministic synthesis path is not used** for that run (or behind explicit flag); model output **parses to** **`SynthesisOutput`**; invalid JSON handled per spec; tests mock OpenAI.
+
+---
+
 ## Epic 7: Delivery and consumption
 
-**Goal:** **Render** the final insight report, **distribute** to recipients, support **reading** without special clients, and **human-judgment** framing.
+**Goal:** **Render** the final insight report, **distribute** to recipients (including optional **Slack** summaries), support **reading** without special clients, and **human-judgment** framing.
 
 ### Story 7.1: Render structured insight report artifact
 
@@ -619,6 +697,44 @@ So that **pursuit remains explicitly human-owned** (FR22).
 **When** a recipient reads the executive section and each opportunity
 **Then** **disclaimer language** states items are **recommendations** and **pursuit decisions are human-owned**
 **And** disclaimer is **visible** (e.g. summary + footer), not buried-only
+
+---
+
+### Story 7.5: Slack webhook delivery
+
+As a **workflow operator** or **report recipient**,
+I want **a Slack notification with key insight-run context when a webhook URL is configured**,
+So that **R&D and marketing see signal highlights and where to open the full HTML report without polling** (extends FR19 delivery surfaces).
+
+**Acceptance Criteria:**
+
+**Given** **`PHARMA_RD_SLACK_WEBHOOK_URL`** is set  
+**When** Delivery has written **`report.html`** to the artifact root  
+**Then** a **Slack Block Kit** message is **POST**ed to the webhook with **branding**, **run date**, **signal characterization** summary, **top ranked opportunities** (short rationale + commercial viability excerpt), **monitoring scope** (therapeutic areas and competitor watchlists from configuration), **FR22** disclaimer text, and a **report location** line (MVP: **on-disk path** to the HTML file; designed so a **URL** can replace the path later without rewriting Block assembly)
+
+**Given** the webhook URL is **not** set  
+**When** Delivery runs  
+**Then** Slack is **skipped** with a **structured INFO log** (no crash, no error)
+
+**Given** Slack POST **fails**  
+**When** the error is handled  
+**Then** the failure is **logged** with actionable detail and the run does **not** fail solely because of Slack (NFR-R1 alignment)
+
+---
+
+### Story 7.6: GPT-powered report narrative and formatting
+
+As a **workflow operator**,
+I want **`report.html` / `report.md` produced by GPT-4o as a senior pharmaceutical strategy consultant**,
+So that **executive prose, narrative per opportunity, commercial conclusion, FR22 disclaimer, and CEO-ready HTML styling** replace template assembly (extends FR18, FR22).
+
+**Specification:** `_bmad-output/implementation-artifacts/7-6-gpt-powered-report-narrative-and-formatting.md`
+
+**Acceptance Criteria (summary):**
+
+**Given** **`SynthesisOutput`** exists and the API key is set  
+**When** Delivery runs  
+**Then** OpenAI returns **sanitized** HTML suitable for browser + Slack; **FR22** visible; distribution and **7.5** Slack remain functional; tests mock API.
 
 ---
 
@@ -707,6 +823,7 @@ So that **insight artifacts are not world-readable** (FR32, NFR-S2).
 ### FR coverage
 
 - **FR1–FR32** (MVP) are covered by Stories **1.1–8.5** and the FR coverage map.
+- **Stories 3.3, 4.4, 5.4, 6.5, 7.6** deepen LLM-assisted interpretation and reporting while **remaining traceable** to the same FR IDs (see **LLM enhancement stories** table).
 - **FR33–FR35** are explicitly **out of MVP** and listed under Roadmap.
 
 ### Architecture compliance
@@ -729,6 +846,8 @@ So that **insight artifacts are not world-readable** (FR32, NFR-S2).
 ### Dependency note (ordering recommendation)
 
 Recommended implementation order: **Epic 1 → Epic 8 (config) in parallel with Epic 2 → Epics 3, 4, 5 (can parallelize after contracts) → Epic 6 → Epic 7**.
+
+**GPT extension order (after baseline MVP):** shared OpenAI client → **3.3, 4.4, 5.4** (parallel) → **6.5** → **7.6**.
 
 ---
 

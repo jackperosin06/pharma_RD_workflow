@@ -16,6 +16,7 @@ from pathlib import Path
 from pydantic import BaseModel
 
 from pharma_rd.agents import clinical, competitor, consumer, delivery, synthesis
+from pharma_rd.config import get_settings
 from pharma_rd.http_client import ConnectorFailure
 from pharma_rd.logging_setup import (
     configure_pipeline_logging,
@@ -23,7 +24,11 @@ from pharma_rd.logging_setup import (
     pipeline_run_logging,
     stage_logging,
 )
-from pharma_rd.persistence.artifacts import read_artifact_bytes, write_stage_artifact
+from pharma_rd.persistence.artifacts import (
+    read_artifact_bytes,
+    read_stage_artifact_model,
+    write_stage_artifact,
+)
 from pharma_rd.persistence.repository import RunRepository
 from pharma_rd.pipeline.contracts import (
     ClinicalOutput,
@@ -100,15 +105,21 @@ def _execute_stage(
             )
             out = consumer.run_consumer(run_id, prev2)
         elif stage_key == "synthesis":
-            prev3 = ConsumerOutput.model_validate_json(
-                read_artifact_bytes(artifact_root, run_id, "consumer")
+            clin = read_stage_artifact_model(
+                artifact_root, run_id, "clinical", ClinicalOutput
             )
-            out = synthesis.run_synthesis(run_id, prev3)
+            comp = read_stage_artifact_model(
+                artifact_root, run_id, "competitor", CompetitorOutput
+            )
+            cons = read_stage_artifact_model(
+                artifact_root, run_id, "consumer", ConsumerOutput
+            )
+            out = synthesis.run_synthesis(run_id, clin, comp, cons)
         elif stage_key == "delivery":
             prev4 = SynthesisOutput.model_validate_json(
                 read_artifact_bytes(artifact_root, run_id, "synthesis")
             )
-            out = delivery.run_delivery(run_id, prev4)
+            out = delivery.run_delivery(run_id, prev4, artifact_root)
         else:
             raise ValueError(f"unknown stage_key: {stage_key!r}")
 
@@ -186,9 +197,14 @@ def run_pipeline(
     repo = repo or RunRepository()
     prior_upstream_completed = 0
     with pipeline_run_logging(run_id):
+        _settings = get_settings()
         _log.info(
             "pipeline run started",
-            extra={"event": "run_started", "outcome": None},
+            extra={
+                "event": "run_started",
+                "outcome": None,
+                "deployment_profile": _settings.deployment_profile,
+            },
         )
         repo.update_run_status(conn, run_id, "running")
         completed = 0
@@ -249,12 +265,14 @@ def run_pipeline_resume_from(
     prior_upstream_completed = start_idx
 
     with pipeline_run_logging(run_id):
+        _settings = get_settings()
         _log.info(
             "pipeline resume started",
             extra={
                 "event": "pipeline_resume",
                 "outcome": None,
                 "resumed_from_stage": start_stage_key,
+                "deployment_profile": _settings.deployment_profile,
             },
         )
         repo.update_run_status(conn, run_id, "running")

@@ -10,6 +10,8 @@ requires-python = ">=3.12"
 dependencies = [
     "apscheduler>=3.10.0",
     "httpx>=0.28.1",
+    "nh3>=0.3.4",
+    "openai>=1.59.0,<3",
     "pydantic>=2.12.5",
     "pydantic-settings>=2.11.0",
 ]

@@ -1,0 +1,14 @@
+{
+  "unmet_need_demand_signals": [
+    {
+      "signal": "Faster onset pain relief",
+      "summary": "Panel discussions cite unmet need for OTC analgesics with quicker perceived onset in acute use cases.",
+      "source": "market-scan://example/category-q4"
+    },
+    {
+      "signal": "Convenience packaging",
+      "summary": "Demand signals favor single-dose portable formats for travel.",
+      "source": "fixture://unmet-need/sample"
+    }
+  ]
+}
