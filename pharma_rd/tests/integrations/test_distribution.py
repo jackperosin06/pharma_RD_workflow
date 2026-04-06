@@ -116,6 +116,72 @@ def test_distribute_file_drop_copies_html_and_manifest(
     validate_readable_insight_report(rd_md)
 
 
+def test_distribute_file_drop_copies_pdf_when_present(
+    caplog: pytest.LogCaptureFixture, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    caplog.set_level(logging.INFO)
+    art = tmp_path / "artifacts"
+    drop = tmp_path / "drop"
+    rid = "run-pdf"
+    report = art / rid / "delivery" / "report.md"
+    report.parent.mkdir(parents=True)
+    report.write_text(
+        "## Run summary\n\n## Ranked opportunities\n(none)\n"
+        "## Governance and disclaimer\nx\n",
+        encoding="utf-8",
+    )
+    pdf = art / rid / "delivery" / "report.pdf"
+    pdf.write_bytes(b"%PDF-1.4\n")
+    monkeypatch.setenv("PHARMA_RD_DISTRIBUTION_CHANNEL", "file_drop")
+    monkeypatch.setenv("PHARMA_RD_DISTRIBUTION_DROP_DIR", str(drop))
+    get_settings.cache_clear()
+    ch, st, _det = distribute_insight_report(
+        rid,
+        art,
+        settings=get_settings(),
+        logger=get_pipeline_logger("test.distribution"),
+    )
+    assert ch == "file_drop"
+    assert st == "ok"
+    rd_pdf = drop / "rd" / rid / "report.pdf"
+    assert rd_pdf.read_bytes() == pdf.read_bytes()
+    man = json.loads((drop / rid / "manifest.json").read_text(encoding="utf-8"))
+    assert man["source_artifact_pdf_relative"] == f"{rid}/delivery/report.pdf"
+
+
+def test_distribute_file_drop_copies_docx_when_present(
+    caplog: pytest.LogCaptureFixture, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    caplog.set_level(logging.INFO)
+    art = tmp_path / "artifacts"
+    drop = tmp_path / "drop"
+    rid = "run-docx"
+    report = art / rid / "delivery" / "report.md"
+    report.parent.mkdir(parents=True)
+    report.write_text(
+        "## Run summary\n\n## Ranked opportunities\n(none)\n"
+        "## Governance and disclaimer\nx\n",
+        encoding="utf-8",
+    )
+    docx = art / rid / "delivery" / "report.docx"
+    docx.write_bytes(b"PK\x03\x04fake-docx")
+    monkeypatch.setenv("PHARMA_RD_DISTRIBUTION_CHANNEL", "file_drop")
+    monkeypatch.setenv("PHARMA_RD_DISTRIBUTION_DROP_DIR", str(drop))
+    get_settings.cache_clear()
+    ch, st, _det = distribute_insight_report(
+        rid,
+        art,
+        settings=get_settings(),
+        logger=get_pipeline_logger("test.distribution"),
+    )
+    assert ch == "file_drop"
+    assert st == "ok"
+    rd_docx = drop / "rd" / rid / "report.docx"
+    assert rd_docx.read_bytes() == docx.read_bytes()
+    man = json.loads((drop / rid / "manifest.json").read_text(encoding="utf-8"))
+    assert man["source_artifact_docx_relative"] == f"{rid}/delivery/report.docx"
+
+
 def test_distribute_file_drop_missing_drop_dir(
     caplog: pytest.LogCaptureFixture, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -65,6 +65,10 @@ def test_run_delivery_writes_report_and_output_metadata(
     assert out.distribution_detail
     assert out.slack_notify_status == "skipped"
     assert out.slack_notify_detail == ""
+    assert out.report_pdf_byte_size == 0
+    assert out.report_docx_byte_size == 0
+    assert out.slack_pdf_upload_status == "skipped"
+    assert out.slack_docx_upload_status == "skipped"
     assert any(
         getattr(r, "event", None) == "slack_notify_skipped" for r in caplog.records
     )
@@ -72,7 +76,7 @@ def test_run_delivery_writes_report_and_output_metadata(
     report = report_path.read_text(encoding="utf-8")
     assert rid in report
     assert "net_new" in report
-    assert "Clinical: pubs=1" in report
+    assert "Clinical —" in report and "publication(s) in scope" in report
     assert "Alpha" in report
     assert "pmid:99" in report
     assert "Governance and disclaimer" in report
@@ -91,10 +95,11 @@ def test_run_delivery_writes_report_and_output_metadata(
         ),
     )
     html = (root / rid / "delivery" / "report.html").read_text(encoding="utf-8")
-    assert "<h2>Run summary</h2>" in html
-    assert "<h2>Ranked opportunities</h2>" in html
-    assert "<h2>Governance and disclaimer</h2>" in html
-    assert "<footer>" in html
+    assert "Run summary" in html
+    assert "Ranked opportunities" in html
+    assert "Governance and disclaimer" in html
+    assert "report-hero" in html
+    assert "opp-card" in html
     assert "Human judgment (FR22)" in html
     assert "Deployment (FR26)" in html
     assert "enterprise sso" in html.lower()
@@ -225,8 +230,7 @@ def test_run_delivery_slack_webhook_configured_posts_blocks(
         body = kwargs["json"]
         assert "blocks" in body
         joined = str(body["blocks"]) + body.get("text", "")
-        assert "pharma_RD" in joined
-        assert "recommendations" in joined.lower()
+        assert "Weekly research brief" in joined
         assert "First" in joined
     finally:
         get_settings.cache_clear()

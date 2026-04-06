@@ -255,6 +255,7 @@ ReportFormat = Literal["markdown"]
 DistributionChannel = Literal["none", "file_drop", "smtp"]
 DistributionStatus = Literal["ok", "failed", "skipped"]
 SlackNotifyStatus = Literal["ok", "skipped", "failed"]
+SlackPdfUploadStatus = Literal["ok", "skipped", "failed"]
 
 
 class DeliveryOutput(BaseModel):
@@ -269,9 +270,17 @@ class DeliveryOutput(BaseModel):
     report_byte_size: int = Field(default=0, ge=0)
     report_html_relative_path: str = ""
     report_html_byte_size: int = Field(default=0, ge=0)
+    report_pdf_relative_path: str = ""
+    report_pdf_byte_size: int = Field(default=0, ge=0)
+    report_docx_relative_path: str = ""
+    report_docx_byte_size: int = Field(default=0, ge=0)
     distribution_channel: DistributionChannel = "none"
     distribution_status: DistributionStatus = "skipped"
     distribution_detail: str = ""
     slack_notify_status: SlackNotifyStatus = "skipped"
     slack_notify_detail: str = ""
+    slack_pdf_upload_status: SlackPdfUploadStatus = "skipped"
+    slack_pdf_upload_detail: str = ""
+    slack_docx_upload_status: SlackPdfUploadStatus = "skipped"
+    slack_docx_upload_detail: str = ""
     note: str = "stub"

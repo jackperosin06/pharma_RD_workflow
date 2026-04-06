@@ -34,12 +34,26 @@ def test_format_report_location_filesystem_vs_base_url(tmp_path: Path) -> None:
     root = tmp_path / "artifacts"
     root.mkdir()
     p = format_report_location_for_notification(root, rid, base_url=None)
-    assert p == f"{rid}/delivery/report.html"
+    assert p == f"{rid}/delivery/report.docx"
 
     u = format_report_location_for_notification(
         root, rid, base_url="https://reports.example.com/reports"
     )
-    assert u == "https://reports.example.com/reports/run-x/delivery/report.html"
+    assert u == "https://reports.example.com/reports/run-x/delivery/report.docx"
+
+    h = format_report_location_for_notification(
+        root, rid, base_url=None, report_basename="report.html"
+    )
+    assert h == f"{rid}/delivery/report.html"
+
+
+def test_format_report_location_rejects_bad_basename(tmp_path: Path) -> None:
+    root = tmp_path / "artifacts"
+    root.mkdir()
+    with pytest.raises(ValueError, match="report_basename"):
+        format_report_location_for_notification(
+            root, "run-x", base_url=None, report_basename="report.exe"
+        )
 
 
 def test_format_report_location_rejects_escape_attempts(tmp_path: Path) -> None:
@@ -120,6 +134,60 @@ def test_build_slack_blocks_tied_rank_sorts_by_title() -> None:
     assert pos_alpha < pos_zebra
 
 
+def test_build_slack_rationale_truncates_on_sentence_boundary() -> None:
+    """Long rationale should not end mid-sentence when a sentence fits in the cap."""
+    first = "A" * 38 + ". "
+    rest = "B" * 400
+    syn = SynthesisOutput(
+        schema_version=5,
+        run_id="r1",
+        signal_characterization="quiet",
+        ranked_opportunities=[
+            RankedOpportunityItem(
+                rank=1,
+                title="Op",
+                rationale_short=first + rest,
+                domain_coverage=DomainCoverage(
+                    clinical=True, competitor=False, consumer=False
+                ),
+                commercial_viability="C" * 500,
+            ),
+        ],
+    )
+    blocks, _ = build_slack_insight_blocks(
+        run_id="r1",
+        run_date_utc=date(2026, 1, 1),
+        synthesis=syn,
+        settings=Settings(),
+        artifact_root=Path("/tmp"),
+    )
+    dumped = str(blocks)
+    assert "Why it matters:" in dumped
+    assert "…" in dumped
+    assert "B" * 20 not in dumped
+    assert (first.rstrip() + "…") in dumped or first.rstrip() in dumped
+
+
+def test_build_slack_blocks_no_fr22_or_governance_in_slack_message() -> None:
+    syn = SynthesisOutput(
+        schema_version=5,
+        run_id="r1",
+        signal_characterization="quiet",
+        ranked_opportunities=[],
+    )
+    blocks, text_fb = build_slack_insight_blocks(
+        run_id="r1",
+        run_date_utc=date(2026, 1, 1),
+        synthesis=syn,
+        settings=Settings(),
+        artifact_root=Path("/tmp"),
+    )
+    combined = str(blocks) + text_fb
+    assert "(FR22)" not in combined
+    assert "Human judgment" not in combined
+    assert "human-owned" not in combined.lower()
+
+
 def test_build_slack_blocks_contains_ac_content() -> None:
     syn = SynthesisOutput(
         schema_version=5,
@@ -159,23 +227,44 @@ def test_build_slack_blocks_contains_ac_content() -> None:
     )
     assert blocks
     dumped = str(blocks) + text_fb
-    assert "pharma_RD insight report" in dumped
-    assert "net_new" in dumped or "high-signal" in dumped
+    assert "Weekly research brief" in dumped
+    assert "strong week" in dumped or "stood out" in dumped
     assert "Op A" in dumped
     assert "Oncology" in dumped
     assert "Acme" in dumped
-    assert "recommendations" in dumped.lower()
-    assert "human-owned" in dumped.lower()
+    assert "What I monitored" in dumped
+    assert "report.docx" in dumped
     assert "report.html" in dumped
 
 
+def test_build_slack_blocks_therapeutic_areas_override_from_run() -> None:
+    """Clinical artifact scope can be passed explicitly (matches monitored TAs)."""
+    syn = SynthesisOutput(
+        schema_version=5,
+        run_id="r1",
+        signal_characterization="quiet",
+        ranked_opportunities=[],
+    )
+    blocks, _ = build_slack_insight_blocks(
+        run_id="r1",
+        run_date_utc=date(2026, 1, 1),
+        synthesis=syn,
+        settings=Settings(),
+        artifact_root=Path("/tmp"),
+        therapeutic_areas=["Dermatology", "Immunology"],
+    )
+    dumped = str(blocks)
+    assert "Dermatology" in dumped
+    assert "Immunology" in dumped
+    assert "No therapeutic-area list" not in dumped
+
+
 def test_send_slack_skipped_no_post_no_url(
-    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     import logging
 
     caplog.set_level(logging.INFO)
-    monkeypatch.delenv("PHARMA_RD_SLACK_WEBHOOK_URL", raising=False)
     get_settings.cache_clear()
     syn = SynthesisOutput(run_id="a", signal_characterization="quiet")
     st, det = send_slack_insight_notification(
@@ -245,8 +334,8 @@ def test_send_slack_posts_httpx_json_with_blocks(
     assert isinstance(body["blocks"], list)
     assert "text" in body
     dumped = str(body["blocks"]) + body["text"]
-    assert "pharma_RD" in dumped
-    assert "recommendations" in dumped.lower()
+    assert "Weekly research brief" in dumped
+    assert "At a glance" in dumped or "quieter week" in dumped
     complete = any(
         getattr(r, "event", None) == "slack_notify_complete" for r in caplog.records
     )

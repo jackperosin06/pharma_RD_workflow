@@ -21,6 +21,12 @@ _FIXTURE_IR = (
     / "internal_research"
     / "sample.json"
 )
+_FIXTURE_CLINICAL = (
+    Path(__file__).resolve().parent.parent
+    / "fixtures"
+    / "clinical"
+    / "sample.json"
+)
 
 
 @pytest.fixture(autouse=True)
@@ -60,6 +66,39 @@ def test_run_clinical_loads_internal_research_fixture() -> None:
     assert len(out.internal_research_items) == 1
     assert "Practice-mode" in out.internal_research_items[0].title
     assert any("loaded" in n.lower() for n in out.integration_notes)
+
+
+def test_run_clinical_fixture_skips_live_pubmed() -> None:
+    with patch.dict(
+        "os.environ",
+        {
+            "PHARMA_RD_THERAPEUTIC_AREAS": "cardiovascular, pain management",
+            "PHARMA_RD_CLINICAL_FIXTURE_PATH": str(_FIXTURE_CLINICAL),
+        },
+        clear=False,
+    ):
+        with patch(
+            "pharma_rd.agents.clinical.fetch_publications_for_labels",
+        ) as mock_pub:
+            out = run_clinical("run-fixture")
+            mock_pub.assert_not_called()
+    assert len(out.publication_items) == 10
+    assert out.therapeutic_areas_configured == ["cardiovascular", "pain management"]
+    assert any("no live pubmed" in n.lower() for n in out.integration_notes)
+    assert any("Semaglutide" in p.title for p in out.publication_items)
+    assert _SKIP_KEY_NOTE in out.integration_notes
+
+
+def test_run_clinical_fixture_without_ta_labels_adds_notes() -> None:
+    with patch.dict(
+        "os.environ",
+        {"PHARMA_RD_CLINICAL_FIXTURE_PATH": str(_FIXTURE_CLINICAL)},
+        clear=False,
+    ):
+        out = run_clinical("run-fix-no-ta")
+    assert len(out.publication_items) == 10
+    assert out.therapeutic_areas_configured == []
+    assert any("demo data only" in n.lower() for n in out.integration_notes)
 
 
 def test_run_clinical_with_mocked_pubmed() -> None:

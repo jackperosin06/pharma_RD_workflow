@@ -236,13 +236,20 @@ def test_run_synthesis_truncation_note_in_gaps() -> None:
     assert any("[synthesis]" in g for g in out.aggregated_upstream_gaps)
 
 
-def test_gpt_mode_without_api_key_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_gpt_mode_without_api_key_falls_back_to_deterministic(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.setenv("PHARMA_RD_SYNTHESIS_MODE", "gpt")
-    monkeypatch.delenv("PHARMA_RD_OPENAI_API_KEY", raising=False)
+    # Override any value from a local .env (delenv alone is not enough).
+    monkeypatch.setenv("PHARMA_RD_OPENAI_API_KEY", "")
     get_settings.cache_clear()
     rid = "rid-no-key"
-    with pytest.raises(ValueError, match="PHARMA_RD_OPENAI_API_KEY"):
-        run_synthesis(rid, _clinical(rid), _competitor(rid), _consumer(rid))
+    out = run_synthesis(rid, _clinical(rid), _competitor(rid), _consumer(rid))
+    assert out.ranking_criteria_version == "cross_domain_v1"
+    assert any(
+        "GPT synthesis skipped" in g and "OPENAI_API_KEY" in g
+        for g in out.aggregated_upstream_gaps
+    )
 
 
 def test_gpt_synthesis_mocked_openai(monkeypatch: pytest.MonkeyPatch) -> None:

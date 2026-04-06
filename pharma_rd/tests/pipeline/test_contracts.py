@@ -69,6 +69,14 @@ def test_delivery_output_v3_json_gets_slack_defaults() -> None:
     out = DeliveryOutput.model_validate_json(legacy)
     assert out.slack_notify_status == "skipped"
     assert out.slack_notify_detail == ""
+    assert out.report_pdf_relative_path == ""
+    assert out.report_pdf_byte_size == 0
+    assert out.slack_pdf_upload_status == "skipped"
+    assert out.slack_pdf_upload_detail == ""
+    assert out.report_docx_relative_path == ""
+    assert out.report_docx_byte_size == 0
+    assert out.slack_docx_upload_status == "skipped"
+    assert out.slack_docx_upload_detail == ""
 
 
 def test_delivery_output_v2_json_gets_fr19_defaults() -> None:

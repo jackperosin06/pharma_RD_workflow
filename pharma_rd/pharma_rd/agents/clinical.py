@@ -4,6 +4,9 @@ from __future__ import annotations
 
 from pharma_rd.agents.connector_probe import ensure_connector_probe
 from pharma_rd.config import Settings, get_settings
+from pharma_rd.integrations.clinical_publications_fixture import (
+    ingest_clinical_publication_fixture,
+)
 from pharma_rd.integrations.internal_research import ingest_internal_research
 from pharma_rd.integrations.openai_clinical import call_clinical_gpt_analysis
 from pharma_rd.integrations.pubmed import fetch_publications_for_labels
@@ -86,7 +89,45 @@ def run_clinical(run_id: str) -> ClinicalOutput:
     settings = get_settings()
     labels = settings.therapeutic_area_labels()
 
-    if not labels:
+    use_fixture = settings.clinical_fixture_path is not None
+
+    if use_fixture:
+        items, notes, gaps = ingest_clinical_publication_fixture(settings)
+        _log.info(
+            "clinical publication fixture loaded",
+            extra={
+                "event": "clinical_publications",
+                "outcome": "ok",
+                "publication_count": len(items),
+                "fixture_mode": True,
+            },
+        )
+        base = ClinicalOutput(
+            schema_version=3,
+            run_id=run_id,
+            therapeutic_areas_configured=labels,
+            publication_items=items,
+            data_gaps=gaps,
+            integration_notes=notes,
+        )
+        if not labels:
+            base = base.model_copy(
+                update={
+                    "data_gaps": list(base.data_gaps)
+                    + [
+                        "No therapeutic areas configured. Set "
+                        "PHARMA_RD_THERAPEUTIC_AREAS (comma-separated labels) to align "
+                        "PubMed-style scope with portfolio monitoring (FR23 / NFR-I1)."
+                    ],
+                    "integration_notes": list(base.integration_notes)
+                    + [
+                        "Clinical publication fixture used without therapeutic area "
+                        "labels — demo data only; configure "
+                        "PHARMA_RD_THERAPEUTIC_AREAS for scoped monitoring."
+                    ],
+                }
+            )
+    elif not labels:
         _log.info(
             "clinical stage completed without PubMed query (no TA scope)",
             extra={

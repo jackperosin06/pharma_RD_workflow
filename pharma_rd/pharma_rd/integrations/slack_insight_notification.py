@@ -7,6 +7,7 @@ orchestrates only. Does not import ``pharma_rd.agents.delivery`` (avoid cycles).
 from __future__ import annotations
 
 import logging
+import re
 from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -19,16 +20,14 @@ from pharma_rd.config import Settings
 if TYPE_CHECKING:
     from pharma_rd.pipeline.contracts import SlackNotifyStatus, SynthesisOutput
 
-# Mirror FR22 tone from ``delivery.py`` (single legal meaning; Slack-sized).
-_FR22_SLACK = (
-    "Items in this report are *recommendations* for review only—not *approvals*. "
-    "*Pursuit and portfolio decisions remain human-owned* (FR22)."
-)
-
 # Slack ``section`` mrkdwn practical caps (Block Kit allows 3000; stay smaller).
 _CAP_RATIONALE = 220
 _CAP_COMMERCIAL = 140
 _CAP_FALLBACK_TEXT = 3500
+
+_ALLOWED_REPORT_BASENAMES = frozenset(
+    {"report.docx", "report.html", "report.md", "report.pdf"}
+)
 
 
 def format_report_location_for_notification(
@@ -36,18 +35,27 @@ def format_report_location_for_notification(
     run_id: str,
     *,
     base_url: str | None = None,
+    report_basename: str = "report.docx",
 ) -> str:
-    """Where to open the HTML report: filesystem path (MVP) or future HTTPS URL.
+    """Filesystem-relative path or HTTPS URL to a report file under ``delivery/``.
+
+    Default ``report_basename`` is ``report.docx`` so Slack points at the Word
+    artifact. Use ``report.html`` for browser, etc.
 
     When ``base_url`` is set (e.g. ``https://reports.example.com``), returns a URL
     path under that base without changing Block Kit assembly elsewhere.
     """
-    rel = f"{run_id}/delivery/report.html"
+    if report_basename not in _ALLOWED_REPORT_BASENAMES:
+        raise ValueError(
+            f"report_basename must be one of {_ALLOWED_REPORT_BASENAMES}; "
+            f"got {report_basename!r}"
+        )
+    rel = f"{run_id}/delivery/{report_basename}"
     if base_url is not None:
         b = base_url.strip().rstrip("/")
         return f"{b}/{rel}"
     root = artifact_root.expanduser().resolve()
-    rel_path = Path(run_id) / "delivery" / "report.html"
+    rel_path = Path(run_id) / "delivery" / report_basename
     if rel_path.is_absolute() or any(p == ".." for p in Path(run_id).parts):
         raise ValueError(f"invalid run_id: {run_id!r}")
     resolved = (root / rel_path).resolve()
@@ -68,6 +76,28 @@ def _truncate_at_word(text: str, max_len: int) -> str:
     return cut + "…"
 
 
+# Sentence-ending punctuation followed by whitespace or end of truncated prefix.
+_SENTENCE_END = re.compile(r"[.!?](?:\s|$)")
+
+
+def _truncate_at_sentence_boundary(text: str, max_len: int) -> str:
+    """Shorten text to ``max_len``, preferring the last *complete* sentence in range."""
+    t = " ".join(text.split())
+    if len(t) <= max_len:
+        return t
+    ellipsis = "…"
+    budget = max_len - len(ellipsis)
+    if budget <= 0:
+        return ellipsis[:max_len]
+    prefix = t[:budget]
+    last_end = 0
+    for m in _SENTENCE_END.finditer(prefix):
+        last_end = m.end()
+    if last_end > 0:
+        return t[:last_end].rstrip() + ellipsis
+    return _truncate_at_word(t, max_len)
+
+
 def _escape_slack_mrkdwn_user_text(text: str) -> str:
     """Escape user/config strings embedded in Slack mrkdwn section text."""
     t = text.replace("\\", "\\\\")
@@ -81,26 +111,31 @@ def _escape_slack_mrkdwn_user_text(text: str) -> str:
     return t
 
 
+def _format_brief_date_utc(d: date) -> str:
+    """Readable calendar line, e.g. ``April 6, 2026`` (no zero-padded day)."""
+    return f"{d:%B} {d.day}, {d.year}"
+
+
 def _signal_summary_md(sig: str) -> str:
     if sig == "quiet":
         return (
-            "Executive view: this run looks like a *quiet week*—limited new "
-            "cross-domain signal versus a high-activity week. Open the full report "
-            "for nuance."
+            "Overall this looks like a *quieter week*—lighter cross-domain signal "
+            "than a busy stretch. I still pulled the highlights below; the full "
+            "report has the detail."
         )
     if sig == "net_new":
         return (
-            "Executive view: *high-signal week*—characterization *net_new* suggests "
-            "notable new threads worth review."
+            "This was a *strong week* for new threads—several items tie together "
+            "across domains, so they are worth a careful read."
         )
     if sig == "mixed":
         return (
-            "Executive view: *mixed* signal week—some domains may be quiet while "
-            "others show activity; see ranked items below."
+            "Signal was *mixed* this week—some areas were quiet while others moved. "
+            "The ranked list below is where I focused your attention."
         )
     return (
-        "Executive view: characterization *unknown*—use the full HTML report for "
-        "complete context."
+        "I could not classify the week cleanly from the snapshot alone—use the "
+        "full report for the complete picture."
     )
 
 
@@ -117,17 +152,25 @@ def build_slack_insight_blocks(
     settings: Settings,
     artifact_root: Path,
     gpt_executive_excerpt: str | None = None,
+    therapeutic_areas: list[str] | None = None,
 ) -> tuple[list[dict[str, Any]], str]:
     """Return Block Kit ``blocks`` and a plain ``text`` fallback for Slack clients."""
 
     blocks: list[dict[str, Any]] = []
+    org = (settings.insight_org_display_name or "").strip() or "your organization"
+    brief_when = _format_brief_date_utc(run_date_utc)
+    tas_src = (
+        therapeutic_areas
+        if therapeutic_areas is not None
+        else settings.therapeutic_area_labels()
+    )
 
     blocks.append(
         {
             "type": "header",
             "text": {
                 "type": "plain_text",
-                "text": "pharma_RD insight report",
+                "text": f"Weekly research brief — {org}",
                 "emoji": True,
             },
         }
@@ -137,17 +180,21 @@ def build_slack_insight_blocks(
             "type": "section",
             "text": {
                 "type": "mrkdwn",
-                "text": f"*Run date (UTC):* {run_date_utc.isoformat()}\n"
-                f"*Run ID:* `{_escape_slack_mrkdwn_user_text(run_id)}`",
+                "text": (
+                    f"*Week of* {brief_when} (UTC)\n"
+                    "Here is a short recap of what I reviewed in the monitoring pass—"
+                    "citations and depth are in the full report.\n"
+                    f"Reference: `{_escape_slack_mrkdwn_user_text(run_id)}`"
+                ),
             },
         }
     )
     blocks.append({"type": "divider"})
     if gpt_executive_excerpt and gpt_executive_excerpt.strip():
-        exc = _truncate_at_word(gpt_executive_excerpt.strip(), 900)
-        exec_md = "*Executive summary*\n" + _escape_slack_mrkdwn_user_text(exc)
+        exc = _truncate_at_sentence_boundary(gpt_executive_excerpt.strip(), 900)
+        exec_md = "*At a glance*\n" + _escape_slack_mrkdwn_user_text(exc)
     else:
-        exec_md = "*Executive summary*\n" + _signal_summary_md(
+        exec_md = "*At a glance*\n" + _signal_summary_md(
             synthesis.signal_characterization
         )
     blocks.append(
@@ -165,22 +212,24 @@ def build_slack_insight_blocks(
         synthesis.ranked_opportunities,
         key=lambda r: (r.rank, r.title),
     )[:3]
-    opp_lines: list[str] = ["*Top opportunities (by rank)*"]
+    opp_lines: list[str] = ["*What stood out*"]
     if not ranked:
-        opp_lines.append("_No ranked opportunities in this run._")
+        opp_lines.append("_Nothing was ranked this week—see the report for gaps._")
     else:
         for row in ranked:
             rat = _escape_slack_mrkdwn_user_text(
-                _truncate_at_word(row.rationale_short, _CAP_RATIONALE)
+                _truncate_at_sentence_boundary(row.rationale_short, _CAP_RATIONALE)
             )
             comm = _escape_slack_mrkdwn_user_text(
-                _truncate_at_word(row.commercial_viability or "—", _CAP_COMMERCIAL)
+                _truncate_at_sentence_boundary(
+                    row.commercial_viability or "—", _CAP_COMMERCIAL
+                )
             )
             title_safe = _escape_slack_mrkdwn_user_text(row.title)
             opp_lines.append(
                 f"*{row.rank}.* {title_safe}\n"
-                f"Rationale: {rat}\n"
-                f"Commercial viability: {comm}"
+                f"Why it matters: {rat}\n"
+                f"Commercial angle: {comm}"
             )
     blocks.append(
         {
@@ -190,17 +239,16 @@ def build_slack_insight_blocks(
     )
     blocks.append({"type": "divider"})
 
-    tas = settings.therapeutic_area_labels()
     comps = settings.competitor_labels()
     ta_part = (
-        ", ".join(f"*{_escape_slack_mrkdwn_user_text(t)}*" for t in tas)
-        if tas
-        else "*not configured* / none"
+        ", ".join(f"*{_escape_slack_mrkdwn_user_text(t)}*" for t in tas_src)
+        if tas_src
+        else "_No therapeutic-area list was applied to the clinical scan this run._"
     )
     co_part = (
         ", ".join(f"*{_escape_slack_mrkdwn_user_text(c)}*" for c in comps)
         if comps
-        else "*not configured* / none"
+        else "_No competitor names on the watchlist for this run._"
     )
     blocks.append(
         {
@@ -208,39 +256,39 @@ def build_slack_insight_blocks(
             "text": {
                 "type": "mrkdwn",
                 "text": (
-                    "*Scan / monitoring summary*\n"
-                    f"• Therapeutic areas: {ta_part}\n"
-                    f"• Competitor watchlists: {co_part}"
+                    "*What I monitored*\n"
+                    f"• Therapeutic areas covered: {ta_part}\n"
+                    f"• Competitors on watch: {co_part}"
                 ),
             },
         }
     )
     blocks.append({"type": "divider"})
-    blocks.append(
-        {
-            "type": "section",
-            "text": {
-                "type": "mrkdwn",
-                "text": "*Human judgment (FR22)*\n" + _FR22_SLACK,
-            },
-        }
+    loc_docx = format_report_location_for_notification(
+        artifact_root, run_id, base_url=None, report_basename="report.docx"
     )
-    blocks.append({"type": "divider"})
-    loc = format_report_location_for_notification(artifact_root, run_id, base_url=None)
-    loc_safe = _escape_slack_mrkdwn_user_text(loc)
+    loc_html = format_report_location_for_notification(
+        artifact_root, run_id, base_url=None, report_basename="report.html"
+    )
+    docx_safe = _escape_slack_mrkdwn_user_text(loc_docx)
+    html_safe = _escape_slack_mrkdwn_user_text(loc_html)
     blocks.append(
         {
             "type": "section",
             "text": {
                 "type": "mrkdwn",
-                "text": f"*Full HTML report:*\n`{loc_safe}`",
+                "text": (
+                    "*Full report*\n"
+                    f"• Word: `{docx_safe}`\n"
+                    f"• HTML (browser): `{html_safe}`"
+                ),
             },
         }
     )
 
     fallback = (
-        f"pharma_RD insight report — {run_date_utc.isoformat()} UTC — run {run_id}. "
-        f"Open HTML: {loc}"
+        f"Weekly research brief — {org} — week of {brief_when} UTC — run {run_id}. "
+        f"Word: {loc_docx} — HTML: {loc_html}"
     )
     if len(fallback) > _CAP_FALLBACK_TEXT:
         fallback = fallback[: _CAP_FALLBACK_TEXT - 1] + "…"
@@ -257,6 +305,7 @@ def send_slack_insight_notification(
     logger: logging.Logger,
     timeout_seconds: float,
     gpt_executive_excerpt: str | None = None,
+    therapeutic_areas: list[str] | None = None,
 ) -> tuple[SlackNotifyStatus, str]:
     """POST Block Kit payload to Slack, or skip with structured INFO log."""
 
@@ -280,6 +329,7 @@ def send_slack_insight_notification(
         settings=settings,
         artifact_root=artifact_root,
         gpt_executive_excerpt=gpt_executive_excerpt,
+        therapeutic_areas=therapeutic_areas,
     )
     payload: dict[str, Any] = {"text": text_fb, "blocks": blocks}
     host = _webhook_host_for_log(webhook_url)

@@ -12,6 +12,10 @@ from zoneinfo import ZoneInfo
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+# Resolve `.env` next to `pyproject.toml` so `PHARMA_RD_*` load correctly when the
+# process cwd is the repo root (parent of this package), not only `pharma_rd/`.
+_PHARMA_RD_ROOT = Path(__file__).resolve().parent.parent
+
 _STD_LOG_LEVELS = frozenset({"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"})
 
 # FR23 / story 8.1 — comma-separated TA labels; empty string = no scope (NFR-I1).
@@ -127,7 +131,9 @@ class Settings(BaseSettings):
 
     model_config = SettingsConfigDict(
         env_prefix="PHARMA_RD_",
-        env_file=".env",
+        # Cwd `.env` first, then package-root `.env` (latter wins) so `pharma_rd/.env`
+        # applies when running from the repository root without a root-level `.env`.
+        env_file=(Path(".env"), _PHARMA_RD_ROOT / ".env"),
         env_file_encoding="utf-8",
         extra="ignore",
     )
@@ -242,6 +248,21 @@ class Settings(BaseSettings):
         ge=1024,
         le=10_485_760,
         description="Max bytes per internal research JSON file (MVP guardrail).",
+    )
+    clinical_fixture_path: str | None = Field(
+        default=None,
+        description=(
+            "Optional JSON file or directory of *.json with a top-level "
+            '"publications" array (or a JSON array) of clinical trial publication '
+            "records. When set, the clinical stage loads these rows instead of live "
+            "PubMed (demo / practice)."
+        ),
+    )
+    clinical_fixture_max_file_bytes: int = Field(
+        default=262_144,
+        ge=1024,
+        le=10_485_760,
+        description="Max bytes per clinical publication JSON fixture file.",
     )
     competitor_watchlist: str = Field(
         default="",
@@ -374,6 +395,41 @@ class Settings(BaseSettings):
             "Timeout for Slack webhook POST (seconds); separate from connector HTTP."
         ),
     )
+    slack_bot_token: str | None = Field(
+        default=None,
+        description=(
+            "Slack bot token (xoxb-...) for Web API file upload. Required with "
+            "PHARMA_RD_SLACK_PDF_CHANNEL_ID to post report.pdf to a channel. "
+            "Incoming webhooks cannot attach files (NFR-S1)."
+        ),
+    )
+    slack_pdf_channel_id: str | None = Field(
+        default=None,
+        description=(
+            "Slack channel ID (e.g. C0123…) for PDF upload; the bot must be a member. "
+            "Unset = no PDF upload."
+        ),
+    )
+    slack_pdf_upload_timeout_seconds: float = Field(
+        default=60.0,
+        ge=10.0,
+        le=300.0,
+        description="Timeout for Slack files.upload API (seconds).",
+    )
+    report_pdf_enabled: bool = Field(
+        default=True,
+        description=(
+            "When true, render delivery/report.pdf from the HTML report (WeasyPrint). "
+            "Disable in environments without PDF dependencies."
+        ),
+    )
+    report_docx_enabled: bool = Field(
+        default=True,
+        description=(
+            "When true, write delivery/report.docx (python-docx) for Word-friendly "
+            "distribution."
+        ),
+    )
     openai_api_key: str | None = Field(
         default=None,
         description=(
@@ -404,9 +460,10 @@ class Settings(BaseSettings):
     synthesis_mode: Literal["gpt", "deterministic"] = Field(
         default="gpt",
         description=(
-            "Story 6.5: gpt = OpenAI JSON synthesis when API key is set "
-            "(fails if key missing); deterministic = legacy cross-domain ranking "
-            "without LLM (offline / CI)."
+            "Story 6.5: gpt = OpenAI JSON synthesis when PHARMA_RD_OPENAI_API_KEY "
+            "is set; if gpt and key is unset, synthesis falls back to deterministic "
+            "ranking with a gap note (NFR-I1). deterministic = always use legacy "
+            "ranking without LLM."
         ),
     )
     openai_report_delivery_timeout_seconds: float = Field(
@@ -505,6 +562,14 @@ class Settings(BaseSettings):
         s = str(v).strip()
         return None if not s else s
 
+    @field_validator("clinical_fixture_path", mode="before")
+    @classmethod
+    def empty_clinical_fixture_path_is_none(cls, v: object) -> str | None:
+        if v is None:
+            return None
+        s = str(v).strip()
+        return None if not s else s
+
     @field_validator("competitor_regulatory_path", mode="before")
     @classmethod
     def empty_competitor_regulatory_path_is_none(cls, v: object) -> str | None:
@@ -548,6 +613,22 @@ class Settings(BaseSettings):
     @field_validator("slack_webhook_url", mode="before")
     @classmethod
     def empty_slack_webhook_url_is_none(cls, v: object) -> str | None:
+        if v is None:
+            return None
+        s = str(v).strip()
+        return None if not s else s
+
+    @field_validator("slack_bot_token", mode="before")
+    @classmethod
+    def empty_slack_bot_token_is_none(cls, v: object) -> str | None:
+        if v is None:
+            return None
+        s = str(v).strip()
+        return None if not s else s
+
+    @field_validator("slack_pdf_channel_id", mode="before")
+    @classmethod
+    def empty_slack_pdf_channel_id_is_none(cls, v: object) -> str | None:
         if v is None:
             return None
         s = str(v).strip()

@@ -1,0 +1,44 @@
+{
+  "feedback_themes": [
+    {
+      "theme": "Anticoagulant adherence and daily routine friction",
+      "summary": "Patients on long-term oral anticoagulation for atrial fibrillation describe difficulty fitting twice-daily or variable meal timing around work shifts. Missed doses cluster around travel and holidays; several threads ask for clearer ‘what if I forgot’ guidance and whether once-daily alternatives feel easier to sustain. Unmet need: simpler counseling touchpoints and packaging that reinforces timing without adding pill burden.",
+      "source": "demo: cardiovascular patient community synthesis (FR11)"
+    },
+    {
+      "theme": "Blood pressure regimen complexity and polypharmacy fatigue",
+      "summary": "Consumers managing hypertension with multiple agents report confusion about which tablet treats which symptom and whether side effects are from one drug or the combination. Pill burden and copay stacking drive intentional dose skipping. Unmet need: integrated labeling and prescriber-aligned titration plans that reduce cognitive load for older adults on CV cocktails.",
+      "source": "demo: cardiovascular patient community synthesis (FR11)"
+    },
+    {
+      "theme": "Statin muscle symptoms and tolerance trade-offs",
+      "summary": "Recurring narratives link muscle aches and fatigue to statin therapy, with experimentation across potencies and alternate-day dosing without clinical supervision. Some patients abandon lipid targets after one intolerable formulation. Unmet need: transparent discussion of reversible alternatives and expectation-setting on how long to trial a change before switching class.",
+      "source": "demo: cardiovascular patient community synthesis (FR11)"
+    },
+    {
+      "theme": "Chronic pain: breakthrough dosing and taper anxiety",
+      "summary": "People on around-the-clock analgesics for chronic low back and neuropathic pain describe fear of running out of rescue medication and reluctance to ask prescribers for adjustments. Tapering after improvement triggers anxiety about pain return. Unmet need: predictable rescue protocols and empathetic messaging that separates dependence concerns from legitimate pain control.",
+      "source": "demo: pain management forum aggregate (FR11)"
+    },
+    {
+      "theme": "GI side effects and opioid-sparing expectations",
+      "summary": "Pain cohorts frequently compare nausea, constipation, and sedation across opioids and adjuvants. Consumers want earlier prophylaxis for constipation and realistic timelines for antiemetic benefit. Unmet need: side-effect profiles that are discussed up front with mitigations, not only after symptoms appear.",
+      "source": "demo: pain management forum aggregate (FR11)"
+    },
+    {
+      "theme": "Preference for transdermal and long-acting delivery over frequent oral dosing",
+      "summary": "Across both pain and cardiovascular contexts, patients praise patches and weekly or monthly injectables when they reduce peak-trough swings and daily pill counts. Barriers include site irritation from patches, cold-chain handling for injectables, and insurance hurdles. Unmet need: broader access to delivery formats that match lifestyle without forcing complex prior authorization.",
+      "source": "demo: cross-therapeutic area preference signals (FR11)"
+    },
+    {
+      "theme": "Side-effect profile transparency in switching therapies",
+      "summary": "When switching between agents in the same class (e.g., ACE inhibitors, calcium channel blockers, or SNRIs for pain), patients compare edema, cough, dizziness, and sexual side effects from peer stories more than label text. Unmet need: plain-language comparison tools that map common adverse events and typical onset windows.",
+      "source": "demo: cardiovascular and pain peer narratives (FR11)"
+    },
+    {
+      "theme": "Medication adherence support for asymptomatic conditions",
+      "summary": "Hypertension and dyslipidemia feedback highlights ‘feeling fine’ as a reason to skip doses until a scare event. Pain patients contrast this with symptom-driven dosing—both patterns create adherence gaps. Unmet need: digital reminders and pharmacist touchpoints that connect silent risk to daily behavior without alarmist tone.",
+      "source": "demo: cardiovascular patient community synthesis (FR11)"
+    }
+  ]
+}

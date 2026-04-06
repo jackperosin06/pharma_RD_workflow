@@ -488,10 +488,15 @@ def _observed_at_from_drugsfda_submissions(obj: dict) -> str | None:
 
 
 def _build_openfda_sponsor_search(labels: list[str]) -> str:
+    """OR-query drugsfda by manufacturer (OpenFDA searchable field).
+
+    ``openfda.sponsor_name`` is not indexed for search on this endpoint; use
+    ``openfda.manufacturer_name`` so watchlist labels match sponsor-style names.
+    """
     parts: list[str] = []
     for label in labels:
         esc = label.replace("\\", "\\\\").replace('"', '\\"')
-        parts.append(f'openfda.sponsor_name:"{esc}"')
+        parts.append(f'openfda.manufacturer_name:"{esc}"')
     return " OR ".join(f"({p})" for p in parts)
 
 
@@ -565,7 +570,12 @@ def fetch_openfda_approvals(
         base = "https://api.fda.gov/drug/drugsfda.json"
     url = f"{base}?{urlencode({'search': search, 'limit': str(limit)})}"
 
-    resp = request_with_retries("GET", url, stage_key="competitor")
+    resp = request_with_retries(
+        "GET",
+        url,
+        stage_key="competitor",
+        allow_statuses=frozenset({404}),
+    )
     try:
         data = resp.json()
     except json.JSONDecodeError as e:
@@ -579,6 +589,11 @@ def fetch_openfda_approvals(
 
     if isinstance(data, dict) and data.get("error"):
         err = data["error"]
+        if isinstance(err, dict) and err.get("code") == "NOT_FOUND":
+            notes.append(
+                "OpenFDA drugsfda: no records matched this search (NOT_FOUND)."
+            )
+            return [], notes, []
         msg = err.get("message", err) if isinstance(err, dict) else err
         return [], [], [f"OpenFDA error response: {msg}"]
 

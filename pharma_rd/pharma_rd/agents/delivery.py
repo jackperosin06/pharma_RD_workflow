@@ -2,22 +2,62 @@
 
 from __future__ import annotations
 
-from html import escape
 from pathlib import Path
 
 from pharma_rd.agents.connector_probe import ensure_connector_probe
 from pharma_rd.config import Settings, get_settings
+from pharma_rd.integrations.insight_report_html import (
+    build_insight_report_html,
+    wrap_gpt_body_as_document,
+)
 from pharma_rd.integrations.openai_report_delivery import call_gpt_report_delivery
 from pharma_rd.integrations.report_distribution import distribute_insight_report
+from pharma_rd.integrations.report_docx import build_insight_report_docx
+from pharma_rd.integrations.report_executive_framing import prepare_run_summary_for_report
 from pharma_rd.integrations.report_html_sanitize import sanitize_report_html_fragment
+from pharma_rd.integrations.report_pdf import render_pdf_from_html
 from pharma_rd.integrations.slack_insight_notification import (
     send_slack_insight_notification,
 )
+from pharma_rd.integrations.slack_pdf_upload import (
+    upload_file_to_slack_channel,
+    upload_report_pdf_to_slack,
+)
 from pharma_rd.logging_setup import get_pipeline_logger
-from pharma_rd.persistence.artifacts import write_utf8_artifact_atomic
-from pharma_rd.pipeline.contracts import DeliveryOutput, SynthesisOutput
+from pharma_rd.persistence.artifacts import (
+    read_stage_artifact_model,
+    write_bytes_artifact_atomic,
+    write_utf8_artifact_atomic,
+)
+from pharma_rd.pipeline.contracts import (
+    ClinicalOutput,
+    DeliveryOutput,
+    SlackPdfUploadStatus,
+    SynthesisOutput,
+)
 
 _log = get_pipeline_logger("pharma_rd.agents.delivery")
+
+
+def _therapeutic_areas_for_slack(
+    artifact_root: Path, run_id: str, settings: Settings
+) -> list[str]:
+    """Prefer clinical artifact TA scope (same as the run); fall back to settings."""
+    try:
+        clinical = read_stage_artifact_model(
+            artifact_root, run_id, "clinical", ClinicalOutput
+        )
+        return clinical.therapeutic_areas_configured
+    except (FileNotFoundError, ValueError, OSError) as e:
+        _log.warning(
+            "slack TA scope: clinical artifact missing or invalid; using settings",
+            extra={
+                "event": "slack_ta_scope_fallback",
+                "outcome": "ok",
+                "detail": str(e)[:200],
+            },
+        )
+        return settings.therapeutic_area_labels()
 
 # FR22 — human-owned pursuit language (practice build; edit here for legal review).
 _FR22_EXECUTIVE_PLAIN = (
@@ -85,25 +125,34 @@ def _md_heading_title(s: str) -> str:
 def _render_markdown(run_id: str, syn: SynthesisOutput) -> str:
     settings = get_settings()
     fr26_md, _ = _fr26_deployment_run_summary(settings)
+    rsum = prepare_run_summary_for_report(syn)
     lines: list[str] = []
     lines.append(f"# Insight report ({run_id})\n")
     lines.append("## Run summary\n")
     lines.append(_FR22_EXECUTIVE_MD)
     lines.append(fr26_md)
     lines.append(f"- **signal_characterization:** `{syn.signal_characterization}`\n")
-    lines.append("- **scan_summary (FR28):**\n")
-    if syn.scan_summary_lines:
-        for s in syn.scan_summary_lines:
+    lines.append("- **Monitoring snapshot (FR28):**\n")
+    if rsum.humanized_scan_lines:
+        for s in rsum.humanized_scan_lines:
             lines.append(f"  - {s}\n")
     else:
         lines.append("  - *(none — legacy or empty synthesis)*\n")
-    if syn.aggregated_upstream_gaps:
-        lines.append("- **upstream gaps (preview):**\n")
-        for g in syn.aggregated_upstream_gaps[:10]:
+    if rsum.coverage_gap_lines:
+        lines.append("- **Coverage and configuration gaps (preview):**\n")
+        for g in rsum.coverage_gap_lines:
             lines.append(f"  - {g}\n")
-        extra = len(syn.aggregated_upstream_gaps) - 10
-        if extra > 0:
-            lines.append(f"  - … ({extra} more)\n")
+        if rsum.coverage_remaining:
+            lines.append(f"  - … ({rsum.coverage_remaining} more)\n")
+    if rsum.operator_gap_lines:
+        lines.append("- **Technical pipeline notes (operators):**\n")
+        lines.append(
+            "  - *Internal telemetry for this run; JSON artifacts hold full detail.*\n"
+        )
+        for g in rsum.operator_gap_lines:
+            lines.append(f"  - {g}\n")
+        if rsum.operator_remaining:
+            lines.append(f"  - … ({rsum.operator_remaining} more)\n")
     lines.append("\n## Ranked opportunities\n")
     if not syn.ranked_opportunities:
         lines.append("(none)\n")
@@ -148,104 +197,11 @@ def _ensure_fr22_markdown(md: str) -> str:
     return _FR22_EXECUTIVE_MD + md
 
 
-def _wrap_gpt_html_fragment(run_id: str, inner: str, settings: Settings) -> str:
-    """Trusted shell around sanitized GPT body fragment (story 7.6)."""
+def _gpt_fr26_block(settings: Settings) -> str:
     _, fr26_html = _fr26_deployment_run_summary(settings)
-    parts: list[str] = []
-    parts.append("<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n")
-    parts.append('<meta charset="utf-8" />\n')
-    parts.append(f"<title>Insight report ({escape(run_id)})</title>\n")
-    parts.append(
-        "<style>"
-        "body{font-family:system-ui,Segoe UI,sans-serif;max-width:52rem;margin:1rem;"
-        "line-height:1.45;}"
-        "pre{white-space:pre-wrap;word-break:break-word;background:#f6f8fa;padding:0.5rem;}"
-        "</style>\n</head>\n<body>\n"
-    )
-    parts.append(inner)
-    parts.append("\n")
-    parts.append(fr26_html)
-    parts.append("</body>\n</html>\n")
-    return "".join(parts)
-
-
-def _render_html(run_id: str, syn: SynthesisOutput) -> str:
-    """Parallel HTML view for NFR-P2 (open in any browser without extensions)."""
-    settings = get_settings()
-    _, fr26_html = _fr26_deployment_run_summary(settings)
-    parts: list[str] = []
-    parts.append("<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n")
-    parts.append('<meta charset="utf-8" />\n')
-    parts.append(f"<title>Insight report ({escape(run_id)})</title>\n")
-    parts.append(
-        "<style>"
-        "body{font-family:system-ui,Segoe UI,sans-serif;max-width:52rem;margin:1rem;"
-        "line-height:1.45;}"
-        "pre{white-space:pre-wrap;word-break:break-word;background:#f6f8fa;padding:0.5rem;}"
-        "</style>\n</head>\n<body>\n"
-    )
-    parts.append(f"<h1>Insight report ({escape(run_id)})</h1>\n")
-    parts.append("<h2>Run summary</h2>\n")
-    parts.append(
-        f"<blockquote><p>{escape(_FR22_EXECUTIVE_PLAIN)}</p></blockquote>\n"
-    )
-    parts.append(fr26_html)
-    parts.append("<ul>\n")
-    parts.append(
-        "<li><strong>signal_characterization:</strong> "
-        f"{escape(str(syn.signal_characterization))}</li>\n"
-    )
-    parts.append("<li><strong>scan_summary (FR28):</strong><ul>\n")
-    if syn.scan_summary_lines:
-        for s in syn.scan_summary_lines:
-            parts.append(f"<li>{escape(s)}</li>\n")
-    else:
-        parts.append("<li><em>(none — legacy or empty synthesis)</em></li>\n")
-    parts.append("</ul></li>\n")
-    if syn.aggregated_upstream_gaps:
-        parts.append("<li><strong>upstream gaps (preview):</strong><ul>\n")
-        for g in syn.aggregated_upstream_gaps[:10]:
-            parts.append(f"<li>{escape(g)}</li>\n")
-        extra = len(syn.aggregated_upstream_gaps) - 10
-        if extra > 0:
-            parts.append(f"<li>… ({extra} more)</li>\n")
-        parts.append("</ul></li>\n")
-    parts.append("</ul>\n")
-    parts.append("<h2>Ranked opportunities</h2>\n")
-    if not syn.ranked_opportunities:
-        parts.append("<p>(none)</p>\n")
-    else:
-        for row in sorted(syn.ranked_opportunities, key=lambda r: r.rank):
-            parts.append(
-                f"<h3>{escape(str(row.rank))}. {escape(row.title)}</h3>\n"
-            )
-            parts.append(
-                f"<p><em>{escape(_FR22_PER_OPPORTUNITY_PLAIN)}</em></p>\n"
-            )
-            parts.append("<p><strong>Rationale</strong></p>\n")
-            parts.append(f"<pre>{escape(row.rationale_short)}</pre>\n")
-            if row.evidence_references:
-                parts.append("<p><strong>Evidence references</strong></p>\n<ul>\n")
-                for er in row.evidence_references:
-                    parts.append(
-                        "<li><strong>"
-                        + escape(er.domain)
-                        + "</strong> — "
-                        + escape(er.label)
-                        + ": "
-                        + escape(er.reference)
-                        + "</li>\n"
-                    )
-                parts.append("</ul>\n")
-            parts.append("<p><strong>Commercial viability</strong></p>\n")
-            parts.append(f"<pre>{escape(row.commercial_viability)}</pre>\n")
-    parts.append("<h2>Governance and disclaimer</h2>\n")
-    parts.append(f"<p>{escape(_FR22_GOVERNANCE_PLAIN)}</p>\n")
-    parts.append("<footer>\n")
-    parts.append(f"<p>{escape(_FR22_FOOTER_PLAIN)}</p>\n")
-    parts.append("</footer>\n")
-    parts.append("</body>\n</html>\n")
-    return "".join(parts)
+    if not fr26_html.strip():
+        return ""
+    return f'<div class="fr26-banner">{fr26_html}</div>'
 
 
 def run_delivery(
@@ -272,7 +228,9 @@ def run_delivery(
             frag = sanitize_report_html_fragment(gpt_result.report_html_fragment)
             frag = _ensure_fr22_html_fragment(frag)
             body = _ensure_fr22_markdown(gpt_result.report_markdown)
-            html_body = _wrap_gpt_html_fragment(run_id, frag, settings)
+            html_body = wrap_gpt_body_as_document(
+                run_id, frag, settings, _gpt_fr26_block(settings)
+            )
             if gpt_result.slack_executive_excerpt:
                 gpt_excerpt = gpt_result.slack_executive_excerpt
         elif settings.report_gpt_fallback_on_error:
@@ -285,7 +243,10 @@ def run_delivery(
                 },
             )
             body = _render_markdown(run_id, synthesis)
-            html_body = _render_html(run_id, synthesis)
+            _, fr26_html = _fr26_deployment_run_summary(settings)
+            html_body = build_insight_report_html(
+                run_id, synthesis, settings, fr26_html
+            )
         else:
             raise ValueError(
                 "GPT report delivery failed and PHARMA_RD_REPORT_GPT_FALLBACK_ON_ERROR "
@@ -298,10 +259,12 @@ def run_delivery(
             extra={"event": "delivery_gpt_skipped_no_key", "outcome": "ok"},
         )
         body = _render_markdown(run_id, synthesis)
-        html_body = _render_html(run_id, synthesis)
+        _, fr26_html = _fr26_deployment_run_summary(settings)
+        html_body = build_insight_report_html(run_id, synthesis, settings, fr26_html)
     else:
         body = _render_markdown(run_id, synthesis)
-        html_body = _render_html(run_id, synthesis)
+        _, fr26_html = _fr26_deployment_run_summary(settings)
+        html_body = build_insight_report_html(run_id, synthesis, settings, fr26_html)
 
     rel, size = write_utf8_artifact_atomic(
         artifact_root,
@@ -313,6 +276,76 @@ def run_delivery(
         (run_id, "delivery", "report.html"),
         html_body,
     )
+    docx_rel = ""
+    docx_size = 0
+    docx_st: SlackPdfUploadStatus = "skipped"
+    docx_det = ""
+    if settings.report_docx_enabled:
+        try:
+            docx_bytes = build_insight_report_docx(run_id, synthesis, settings)
+            docx_rel, docx_size = write_bytes_artifact_atomic(
+                artifact_root,
+                (run_id, "delivery", "report.docx"),
+                docx_bytes,
+            )
+        except Exception as e:
+            _log.warning(
+                "delivery docx render failed",
+                extra={
+                    "event": "delivery_docx_failed",
+                    "outcome": "ok",
+                    "detail": str(e)[:300],
+                    "error_type": type(e).__name__,
+                },
+            )
+        else:
+            docx_st, docx_det = upload_file_to_slack_channel(
+                settings=settings,
+                file_bytes=docx_bytes,
+                filename=f"insight-report-{run_id}.docx",
+                initial_comment=(
+                    f"Weekly insight report (Word) for run `{run_id}` — same structure "
+                    "as report.md / report.html."
+                ),
+                logger=_log,
+                timeout_seconds=settings.slack_pdf_upload_timeout_seconds,
+            )
+    pdf_rel = ""
+    pdf_size = 0
+    pdf_st: SlackPdfUploadStatus = "skipped"
+    pdf_det = ""
+    if settings.report_pdf_enabled:
+        try:
+            pdf_bytes = render_pdf_from_html(html_body)
+            pdf_rel, pdf_size = write_bytes_artifact_atomic(
+                artifact_root,
+                (run_id, "delivery", "report.pdf"),
+                pdf_bytes,
+            )
+        except (RuntimeError, OSError, ImportError) as e:
+            # WeasyPrint: OSError if GLib/Pango/Cairo missing on the host.
+            _log.warning(
+                "delivery pdf render failed",
+                extra={
+                    "event": "delivery_pdf_failed",
+                    "outcome": "ok",
+                    "detail": str(e)[:300],
+                    "error_type": type(e).__name__,
+                },
+            )
+        else:
+            pdf_st, pdf_det = upload_report_pdf_to_slack(
+                settings=settings,
+                pdf_bytes=pdf_bytes,
+                filename=f"insight-report-{run_id}.pdf",
+                initial_comment=(
+                    f"Weekly insight report (PDF) for run `{run_id}` — same content as "
+                    "report.html."
+                ),
+                logger=_log,
+                timeout_seconds=settings.slack_pdf_upload_timeout_seconds,
+            )
+
     _log.info(
         "delivery report written",
         extra={
@@ -322,6 +355,10 @@ def run_delivery(
             "report_byte_size": size,
             "report_html_relative_path": rel_html,
             "report_html_byte_size": size_html,
+            "report_docx_relative_path": docx_rel,
+            "report_docx_byte_size": docx_size,
+            "report_pdf_relative_path": pdf_rel,
+            "report_pdf_byte_size": pdf_size,
         },
     )
     slack_st, slack_det = send_slack_insight_notification(
@@ -333,6 +370,7 @@ def run_delivery(
         logger=_log,
         timeout_seconds=settings.slack_webhook_timeout_seconds,
         gpt_executive_excerpt=gpt_excerpt,
+        therapeutic_areas=_therapeutic_areas_for_slack(artifact_root, run_id, settings),
     )
     d_ch, d_st, d_det = distribute_insight_report(
         run_id,
@@ -348,9 +386,17 @@ def run_delivery(
         report_byte_size=size,
         report_html_relative_path=rel_html,
         report_html_byte_size=size_html,
+        report_pdf_relative_path=pdf_rel,
+        report_pdf_byte_size=pdf_size,
+        report_docx_relative_path=docx_rel,
+        report_docx_byte_size=docx_size,
         distribution_channel=d_ch,
         distribution_status=d_st,
         distribution_detail=d_det,
         slack_notify_status=slack_st,
         slack_notify_detail=slack_det,
+        slack_pdf_upload_status=pdf_st,
+        slack_pdf_upload_detail=pdf_det,
+        slack_docx_upload_status=docx_st,
+        slack_docx_upload_detail=docx_det,
     )

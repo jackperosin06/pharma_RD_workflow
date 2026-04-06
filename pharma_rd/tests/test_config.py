@@ -272,8 +272,8 @@ def test_deployment_profile_invalid_raises(
         get_settings()
 
 
-def test_openai_api_key_unset_optional(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("PHARMA_RD_OPENAI_API_KEY", raising=False)
+def test_openai_api_key_unset_optional() -> None:
+    """Root conftest forces empty key so local ``pharma_rd/.env`` does not leak in."""
     from pharma_rd.config import get_settings
 
     get_settings.cache_clear()

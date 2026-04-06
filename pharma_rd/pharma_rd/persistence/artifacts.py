@@ -137,3 +137,20 @@ def write_utf8_artifact_atomic(
     tmp_path.write_bytes(payload)
     tmp_path.replace(final_path)
     return rel, len(payload)
+
+
+def write_bytes_artifact_atomic(
+    artifact_root: Path,
+    relative_segments: tuple[str, ...],
+    data: bytes,
+) -> tuple[str, int]:
+    """Write binary blob atomically (e.g. ``report.pdf``)."""
+    rel = "/".join(relative_segments)
+    out_dir = artifact_root.joinpath(*relative_segments[:-1])
+    out_dir.mkdir(parents=True, exist_ok=True)
+    final_name = relative_segments[-1]
+    final_path = out_dir / final_name
+    tmp_path = out_dir / f"{final_name}.tmp"
+    tmp_path.write_bytes(data)
+    tmp_path.replace(final_path)
+    return rel, len(data)

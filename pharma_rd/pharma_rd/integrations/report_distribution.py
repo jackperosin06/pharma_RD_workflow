@@ -162,6 +162,26 @@ def distribute_insight_report(
             manifest["rd_report_html_path"] = str(rd_html.resolve())
             manifest["marketing_report_html_path"] = str(mkt_html.resolve())
             manifest["source_artifact_html_relative"] = f"{run_id}/delivery/report.html"
+        docx_src = artifact_root / run_id / "delivery" / "report.docx"
+        if docx_src.is_file():
+            rd_docx = rd_dst / "report.docx"
+            mkt_docx = mkt_dst / "report.docx"
+            shutil.copy2(docx_src, rd_docx)
+            shutil.copy2(docx_src, mkt_docx)
+            manifest["rd_report_docx_path"] = str(rd_docx.resolve())
+            manifest["marketing_report_docx_path"] = str(mkt_docx.resolve())
+            manifest["source_artifact_docx_relative"] = (
+                f"{run_id}/delivery/report.docx"
+            )
+        pdf_src = artifact_root / run_id / "delivery" / "report.pdf"
+        if pdf_src.is_file():
+            rd_pdf = rd_dst / "report.pdf"
+            mkt_pdf = mkt_dst / "report.pdf"
+            shutil.copy2(pdf_src, rd_pdf)
+            shutil.copy2(pdf_src, mkt_pdf)
+            manifest["rd_report_pdf_path"] = str(rd_pdf.resolve())
+            manifest["marketing_report_pdf_path"] = str(mkt_pdf.resolve())
+            manifest["source_artifact_pdf_relative"] = f"{run_id}/delivery/report.pdf"
         manifest_dir = base / run_id
         manifest_dir.mkdir(parents=True, exist_ok=True)
         manifest_path = manifest_dir / "manifest.json"

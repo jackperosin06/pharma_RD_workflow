@@ -85,6 +85,35 @@ def test_transient_exhausted_raises(
         client.close()
 
 
+def test_allow_statuses_returns_response_instead_of_raising(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("PHARMA_RD_HTTP_MAX_RETRIES", "3")
+    from pharma_rd.config import get_settings
+
+    get_settings.cache_clear()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            404,
+            json={"error": {"code": "NOT_FOUND", "message": "No matches found!"}},
+        )
+
+    transport = httpx.MockTransport(handler)
+    client = httpx.Client(transport=transport, follow_redirects=True)
+    try:
+        r = request_with_retries(
+            "GET",
+            "http://example.test/missing",
+            client=client,
+            allow_statuses=frozenset({404}),
+        )
+        assert r.status_code == 404
+        assert r.json()["error"]["code"] == "NOT_FOUND"
+    finally:
+        client.close()
+
+
 def test_non_retryable_4xx_raises_http_client_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

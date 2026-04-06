@@ -49,12 +49,16 @@ def request_with_retries(
     *,
     stage_key: str | None = None,
     client: httpx.Client | None = None,
+    allow_statuses: frozenset[int] | None = None,
 ) -> httpx.Response:
     """Perform an HTTP request using shared timeout and retry policy from settings.
 
     Retries transient failures: timeouts, connection errors, and HTTP
     429 / 500 / 502 / 503 / 504 up to ``http_max_retries`` with exponential backoff.
     Does not log request bodies or secrets.
+
+    ``allow_statuses``: HTTP status codes to return as-is instead of raising
+    (e.g. OpenFDA uses 404 + JSON ``NOT_FOUND`` for zero search hits).
     """
     settings = get_settings()
     timeout = httpx.Timeout(
@@ -150,6 +154,8 @@ def request_with_retries(
                 continue
 
             if code >= 400:
+                if allow_statuses is not None and code in allow_statuses:
+                    return response
                 raise ConnectorFailure(
                     f"HTTP {code} from {url!r} is not retryable; "
                     f"fix URL, auth, or payload.",

@@ -691,9 +691,25 @@ def run_synthesis(
     if settings.synthesis_mode == "deterministic":
         return _run_synthesis_deterministic(run_id, clinical, competitor, consumer)
     if not settings.openai_api_key:
-        raise ValueError(
-            "PHARMA_RD_OPENAI_API_KEY is required when "
-            "PHARMA_RD_SYNTHESIS_MODE=gpt. Set the key for GPT synthesis, or set "
-            "PHARMA_RD_SYNTHESIS_MODE=deterministic for legacy ranking (offline/CI)."
+        _log.info(
+            "synthesis_mode=gpt but PHARMA_RD_OPENAI_API_KEY unset; "
+            "using deterministic ranking (NFR-I1)",
+            extra={
+                "event": "synthesis_gpt_skipped",
+                "outcome": "ok",
+                "reason": "openai_api_key_unset",
+            },
+        )
+        out = _run_synthesis_deterministic(run_id, clinical, competitor, consumer)
+        note = (
+            "GPT synthesis skipped: PHARMA_RD_OPENAI_API_KEY not set while "
+            "PHARMA_RD_SYNTHESIS_MODE=gpt; used deterministic ranking (story 6.5). "
+            "Set the key for GPT synthesis, or set "
+            "PHARMA_RD_SYNTHESIS_MODE=deterministic."
+        )
+        return out.model_copy(
+            update={
+                "aggregated_upstream_gaps": [note, *out.aggregated_upstream_gaps],
+            }
         )
     return _run_synthesis_gpt(run_id, clinical, competitor, consumer)

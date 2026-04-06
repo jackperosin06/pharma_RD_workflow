@@ -70,6 +70,30 @@ def test_fetch_openfda_parses_results(monkeypatch: pytest.MonkeyPatch) -> None:
     assert not gaps
 
 
+def test_fetch_openfda_not_found_returns_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """OpenFDA returns HTTP 404 + NOT_FOUND JSON when a search matches nothing."""
+    monkeypatch.setenv("PHARMA_RD_OPENFDA_DRUGSFDA_URL", "https://api.fda.gov/drug/drugsfda.json")
+    get_settings.cache_clear()
+    mock_resp = MagicMock()
+    mock_resp.json.return_value = {
+        "error": {"code": "NOT_FOUND", "message": "No matches found!"}
+    }
+    mock_resp.status_code = 404
+    with patch(
+        "pharma_rd.integrations.regulatory_signals.request_with_retries",
+        return_value=mock_resp,
+    ):
+        items, notes, gaps = fetch_openfda_approvals(
+            ["NonexistentCo"],
+            settings=get_settings(),
+        )
+    assert items == []
+    assert not gaps
+    assert any("NOT_FOUND" in n or "no records matched" in n for n in notes)
+
+
 def test_fetch_openfda_raises_connector_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
